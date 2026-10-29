@@ -99,3 +99,58 @@ These patterns waste tokens and violate credit-efficiency rules:
 - **Multiple git status checks** → Check only at key checkpoints (before commit, after push)
 - **Incremental code changes and testing** → Complete all edits first, then validate once
 - **Reading large Jira responses multiple times** → Parse once, reuse extracted data
+
+# Customer access cleanup procedure
+
+This repository contains `revoke_customers.py`, which identifies inactive JSM
+portal customers and can remove their access from selected service desks.
+Atlassian accounts are never deleted or deactivated.
+
+## Configuration
+
+Set all five required settings through the operating system environment or
+command-line options. Command-line values take precedence:
+
+| Command-line option | Environment variable | Purpose |
+| --- | --- | --- |
+| `--token` / `--atlassian-token` | `ATLASSIAN_TOKEN` | Organization API bearer token |
+| `--org` / `-o` | `ATLASSIAN_ORG` | Organization ID |
+| `--site` | `ATLASSIAN_SITE` | Jira site base URL; HTTPS is assumed if omitted |
+| `--jira-email` | `JIRA_EMAIL` | Jira account email |
+| `--jira-pat` | `JIRA_PAT` | Jira API token |
+
+The Organization API token is used only for Organization API requests. Jira
+site API calls use Jira Basic authentication. Missing or malformed settings
+cause a clear error and exit code 2.
+
+## Selection and review
+
+Select one target with `--service-desk-id` (`-s`), `--project-key` (`-p`), or
+`--all-service-desks`. By default, the script paginates through service-desk
+customers and Jira issues, identifying portal customers with no issues where
+they are reporter or creator. The Jira account must be able to browse all
+relevant projects for this check to be complete.
+
+An optional `--input-file` selects only listed account IDs/emails and skips
+issue searches. `--exclude-file` (aliases `--filename` and `-f`) is a CSV
+allow list and overrides inclusion in the input file. The script skips
+accounts unless directory and Jira profile data confirm a person with no
+billable/Jira product access, no Jira application roles, and no administrator
+group membership. Incomplete role or group data is skipped.
+Issue-search reports show `0` or `1+` because the check only requests one
+matching issue.
+
+Run without `--live` first. The default is a dry run. Inspect the console
+decisions and timestamped CSV report before approving a live run. Reports
+are created in the current directory and are never overwritten.
+
+```powershell
+python .\revoke_customers.py --service-desk-id 12
+python .\revoke_customers.py --project-key HELP
+python .\revoke_customers.py --all-service-desks --exclude-file .\allow-list.csv
+python .\revoke_customers.py --all-service-desks --input-file .\targets.csv
+python .\revoke_customers.py --service-desk-id 12 --live
+```
+
+Live mode batches customer removals through the JSM service-desk customer
+endpoint. It does not call any account deletion or deactivation endpoint.
