@@ -4,6 +4,8 @@ Remove inactive JSM portal customers from one or every Atlassian service desk.
 Customers are identified by having no reported or created Jira issues, or by
 being explicitly listed in an input file. Access is removed from service
 desks only; Atlassian accounts are never deleted or deactivated.
+JSM portal-only accounts (`qm:` IDs or Jira `accountType=customer`) are
+identified directly and do not require an Organization directory record.
 
 Live execution is the default. Add `--dry-run` to preview removals without
 changing service-desk access.
@@ -88,8 +90,8 @@ python .\AtlRevokeUnverifiedCustomers.py -d 12
 
 ## Output
 
-The script prints each customer’s email, display name, account ID, service
-desk, issue activity, action, and reason, followed by a summary of desks
+The script prints each customer’s email, display name, account ID, account
+type, service desk, issue activity, action, and reason, followed by a summary of desks
 processed, customers scanned, candidates, would-remove/removed totals, skips,
 and errors. `WARN`, `SUCCESS`, and `ERROR` labels and action statuses use color
 in interactive terminals and respect `NO_COLOR`.
@@ -101,6 +103,7 @@ The CSV report contains these columns:
 | `email` | Customer email address |
 | `display_name` | Customer display name |
 | `account_id` | Atlassian account ID |
+| `account_type` | `customer`, `atlassian`, or the profile-reported account type |
 | `service_desk` | Service-desk name |
 | `issues_count` | `0`, `1+`, or why issue activity was not checked |
 | `action` | `would remove`, `removed`, `skipped`, or `error` |
@@ -110,6 +113,13 @@ Issue searches request at most one matching issue, so `issues_count` is
 reported as `0` or `1+`, not as an exact count. In live mode the script
 removes customer access from the selected service desk(s) only. It never
 deletes or deactivates Atlassian accounts.
+
+Portal-only `qm:` customers bypass Organization directory and licensed-user
+checks because they are customer accounts, not Organization directory users.
+Their reported/created Jira issue activity is still checked unless they were
+selected with `--input-file`. Other accounts with Jira `accountType=customer`
+follow the same path. Atlassian accounts continue to require Organization
+directory and Jira role/group checks; missing directory records are skipped.
 
 Transient read-only GET failures (HTTP 429 and common 5xx responses) are
 retried with bounded backoff. Removal requests are never automatically retried.

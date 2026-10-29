@@ -34,6 +34,7 @@ REPORT_COLUMNS = (
     "email",
     "display_name",
     "account_id",
+    "account_type",
     "service_desk",
     "issues_count",
     "action",
@@ -352,12 +353,17 @@ def jira_user_profile(
 
 
 def is_portal_only(
-    org_user: dict[str, Any], profile: dict[str, Any]
+    account_type: str,
+    org_user: dict[str, Any] | None,
+    profile: dict[str, Any] | None,
 ) -> tuple[bool, str]:
-    if (
-        org_user.get("account_type") != "atlassian"
-        or profile.get("accountType") != "atlassian"
-    ):
+    if account_type == "customer":
+        return True, ""
+    if account_type != "atlassian":
+        return False, "not a person Atlassian account"
+    if org_user is None:
+        return False, "not found in organization directory"
+    if profile is None or org_user.get("account_type") != "atlassian":
         return False, "not a person Atlassian account"
     if org_user.get("access_billable") is not False:
         return False, "organization directory does not confirm an unlicensed account"
@@ -449,7 +455,7 @@ def print_row(row: dict[str, str]) -> None:
         action = f"{colors[action]}{action}{ANSI_RESET}"
     print(
         f"{row['email']} | {row['display_name']} | {row['account_id']} | "
-        f"{row['service_desk']} | {row['issues_count']} | "
+        f"{row['account_type']} | {row['service_desk']} | {row['issues_count']} | "
         f"{action}{': ' + row['reason'] if row['reason'] else ''}"
     )
 
@@ -468,7 +474,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
     input_mode = args.input_file is not None
     input_ids = read_identifiers(args.input_file)
     excluded_ids = read_identifiers(args.exclude_file)
-    org_users = load_org_users(config)
+    org_users: dict[str, dict[str, Any]] | None = None
     desks = select_service_desks(args, load_service_desks(config))
     rows: list[dict[str, str]] = []
     requested_matches: set[str] = set()
@@ -490,6 +496,9 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                 "email": email,
                 "display_name": name,
                 "account_id": account_id,
+                "account_type": (
+                    "customer" if account_id.casefold().startswith("qm:") else "not checked"
+                ),
                 "service_desk": desk_name,
                 "issues_count": "",
                 "action": "skipped",
@@ -515,24 +524,32 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                 rows.append(row)
                 continue
 
-            org_user = org_users.get(account_id.casefold())
-            if not org_user:
-                row["issues_count"] = "not checked"
-                row["reason"] = "not found in organization directory"
-                rows.append(row)
-                continue
-            try:
-                profile = jira_user_profile(config, account_id)
-            except ApiError as error:
-                if error.status in {401, 403}:
-                    raise
-                row["action"] = "error"
-                row["issues_count"] = "not checked"
-                row["reason"] = f"Jira profile check failed ({error})"
-                error_count += 1
-                rows.append(row)
-                continue
-            portal_only, reason = is_portal_only(org_user, profile)
+            profile: dict[str, Any] | None = None
+            if row["account_type"] != "customer":
+                try:
+                    profile = jira_user_profile(config, account_id)
+                except ApiError as error:
+                    if error.status in {401, 403}:
+                        raise
+                    row["action"] = "error"
+                    row["issues_count"] = "not checked"
+                    row["reason"] = f"Jira profile check failed ({error})"
+                    error_count += 1
+                    rows.append(row)
+                    continue
+                profile_account_type = profile.get("accountType")
+                if isinstance(profile_account_type, str):
+                    row["account_type"] = profile_account_type.casefold()
+
+            org_user: dict[str, Any] | None = None
+            if row["account_type"] == "atlassian":
+                if org_users is None:
+                    org_users = load_org_users(config)
+                org_user = org_users.get(account_id.casefold())
+
+            portal_only, reason = is_portal_only(
+                row["account_type"], org_user, profile
+            )
             if not portal_only:
                 row["issues_count"] = "not checked"
                 row["reason"] = reason

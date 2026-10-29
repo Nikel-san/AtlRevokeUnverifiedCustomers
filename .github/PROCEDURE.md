@@ -131,6 +131,14 @@ customers and Jira issues, identifying portal customers with no issues where
 they are reporter or creator. The Jira account must be able to browse all
 relevant projects for this check to be complete.
 
+Portal-only accounts identified by a `qm:` account ID are treated as
+`customer` accounts directly and do not require an Organization directory
+record or Jira licensed-user/admin checks. Other accounts are checked through
+their Jira profile. `accountType=customer` is also treated as portal-only;
+`accountType=atlassian` must still pass Organization directory license,
+product-access, and Jira role/group checks. Atlassian accounts missing from
+the Organization directory remain skipped.
+
 An optional `--input-file` selects only listed account IDs/emails and skips
 issue searches. `-f` / `--exclude-file` (alias `--filename`) is a CSV
 allow list and overrides inclusion in the input file. The script skips
@@ -155,6 +163,9 @@ python .\AtlRevokeUnverifiedCustomers.py -d 12
 Without `--dry-run`, the script batches customer removals through the JSM
 service-desk customer endpoint. It does not call any account deletion or
 deactivation endpoint.
+
+Console and CSV output include the account type (`customer`, `atlassian`, or
+the Jira profile's reported type) alongside the customer and action details.
 
 Use `-s` / `--site` for the Jira site hostname or URL (`ATLASSIAN_SITE`).
 `--out PATH` selects a CSV report path; existing files are never overwritten.
