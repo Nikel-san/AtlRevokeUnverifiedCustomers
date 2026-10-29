@@ -4,5 +4,17 @@
 			"path": "."
 		}
 	],
-	"settings": {}
+	"settings": {
+		"mcp": {
+			"servers": {
+				"com.atlassian/atlassian-mcp-server": {
+					"type": "http",
+					"url": "https://mcp.atlassian.com/v2/mcp",
+					"gallery": "https://api.mcp.github.com",
+					"version": "2.0.0"
+				}
+			},
+			"inputs": []
+		}
+	}
 }
