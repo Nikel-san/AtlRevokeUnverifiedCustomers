@@ -140,17 +140,18 @@ group membership. Incomplete role or group data is skipped.
 Issue-search reports show `0` or `1+` because the check only requests one
 matching issue.
 
-Run without `--live` first. The default is a dry run. Inspect the console
-decisions and timestamped CSV report before approving a live run. Reports
-are created in the current directory and are never overwritten.
+Runs remove access by default. Pass `--dry-run` to inspect the console
+decisions and timestamped CSV report without making changes. Reports are
+created in the current directory and are never overwritten.
 
 ```powershell
+python .\AtlRevokeUnverifiedCustomers.py --service-desk-id 12 --dry-run
+python .\AtlRevokeUnverifiedCustomers.py --project-key HELP --dry-run
+python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --exclude-file .\allow-list.csv --dry-run
+python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --input-file .\targets.csv --dry-run
 python .\AtlRevokeUnverifiedCustomers.py --service-desk-id 12
-python .\AtlRevokeUnverifiedCustomers.py --project-key HELP
-python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --exclude-file .\allow-list.csv
-python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --input-file .\targets.csv
-python .\AtlRevokeUnverifiedCustomers.py --service-desk-id 12 --live
 ```
 
-Live mode batches customer removals through the JSM service-desk customer
-endpoint. It does not call any account deletion or deactivation endpoint.
+Without `--dry-run`, the script batches customer removals through the JSM
+service-desk customer endpoint. It does not call any account deletion or
+deactivation endpoint.

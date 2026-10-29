@@ -467,9 +467,9 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
         for index in range(0, len(desk_candidates), REMOVE_BATCH_SIZE):
             batch = desk_candidates[index : index + REMOVE_BATCH_SIZE]
             for row, _, _ in batch:
-                row["action"] = "would remove" if not args.live else "pending"
+                row["action"] = "would remove" if args.dry_run else "pending"
                 row["reason"] = ""
-            if args.live:
+            if not args.dry_run:
                 account_ids = [account_id for _, _, account_id in batch]
                 try:
                     request_json(
@@ -509,7 +509,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Find inactive JSM portal customers; dry run unless --live is set."
+        description="Find inactive JSM portal customers; removals are live unless --dry-run is set."
     )
     parser.add_argument("--token", "--atlassian-token", dest="token")
     parser.add_argument("--org", "-o")
@@ -531,7 +531,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="exclude_file",
         help="CSV allow list of account IDs/emails to skip",
     )
-    parser.add_argument("--live", action="store_true", help="remove access; default is dry run")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report customers without removing service-desk access",
+    )
     return parser.parse_args(argv)
 
 

@@ -3,7 +3,8 @@
 `AtlRevokeUnverifiedCustomers.py` finds JSM portal customers with no issues reported or
 created, or targets only the accounts in an explicitly supplied input list.
 It removes access from service desks only; it never deletes or deactivates
-Atlassian accounts. The default is a dry run.
+Atlassian accounts. Runs remove access by default; pass `--dry-run` to report
+the actions without making changes.
 
 ## Requirements
 
@@ -55,7 +56,7 @@ skipped.
 
 ## Examples
 
-Dry run against one service desk:
+Dry run against one service desk (explicitly opt in to dry-run mode):
 
 ```powershell
 $env:ATLASSIAN_TOKEN = "organization-api-key"
@@ -63,28 +64,29 @@ $env:ATLASSIAN_ORG = "organization-id"
 $env:ATLASSIAN_SITE = "https://your-site.atlassian.net"
 $env:JIRA_EMAIL = "you@example.com"
 $env:JIRA_PAT = "jira-api-token"
-python .\AtlRevokeUnverifiedCustomers.py --service-desk-id 12
+python .\AtlRevokeUnverifiedCustomers.py --service-desk-id 12 --dry-run
 ```
 
-Dry run for a project, or all service desks:
+Dry run for a project or all service desks:
 
 ```powershell
-python .\AtlRevokeUnverifiedCustomers.py --project-key HELP
-python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --exclude-file .\allow-list.csv
+python .\AtlRevokeUnverifiedCustomers.py --project-key HELP --dry-run
+python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --exclude-file .\allow-list.csv --dry-run
 ```
 
 Target only IDs/emails in an input file:
 
 ```powershell
-python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --input-file .\targets.csv
+python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --input-file .\targets.csv --dry-run
 ```
 
-Perform removal after reviewing the dry-run report:
+Perform removal against one service desk (live mode is the default):
 
 ```powershell
-python .\AtlRevokeUnverifiedCustomers.py --service-desk-id 12 --live
+python .\AtlRevokeUnverifiedCustomers.py --service-desk-id 12
 ```
 
 Each run prints per-customer decisions and a summary, and creates a uniquely
-named CSV report in the current directory. `--live` removes customers from
-service desks only; no Atlassian account is deleted or deactivated.
+named CSV report in the current directory. Without `--dry-run`, customers are
+removed from the selected service desk(s); no Atlassian account is deleted or
+deactivated.
