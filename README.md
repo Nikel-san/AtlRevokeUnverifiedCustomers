@@ -1,92 +1,115 @@
-# Atlassian JSM customer access cleanup
+# AtlRevokeUnverifiedCustomers
 
-`AtlRevokeUnverifiedCustomers.py` finds JSM portal customers with no issues reported or
-created, or targets only the accounts in an explicitly supplied input list.
-It removes access from service desks only; it never deletes or deactivates
-Atlassian accounts. Runs remove access by default; pass `--dry-run` to report
-the actions without making changes.
+Remove inactive JSM portal customers from one or every Atlassian service desk.
+Customers are identified by having no reported or created Jira issues, or by
+being explicitly listed in an input file. Access is removed from service
+desks only; Atlassian accounts are never deleted or deactivated.
+
+Live execution is the default. Add `--dry-run` to preview removals without
+changing service-desk access.
 
 ## Requirements
 
-- Python 3.10 or later; the script uses only the standard library.
+- Python 3.10 or later; no additional Python packages are required.
 - An Atlassian Organization API key and organization ID.
 - A Jira API token and Jira account email.
-- Permission to read the organization directory and the Jira projects/issues
-  being checked. The account used for issue search must be able to see all
-  relevant projects; otherwise Jira's search results may not represent all
-  issue participation.
+- Permission to read the organization directory and all Jira projects whose
+  issues should count as customer activity.
+- Permission to list service desks and remove customers from selected desks
+  when running live.
 
-Supply settings as command-line options or environment variables. A supplied
-command-line option takes precedence. The site may be given with or without
-the `https://` scheme; HTTPS is assumed when omitted.
+## Environment variables
 
-| Option | Environment variable | Purpose |
+All five variables are required. Corresponding command-line options override
+environment values. The organization bearer token is used only with the
+Organization API; Jira site requests use Jira Basic authentication.
+
+| Variable | Command-line option | Purpose |
 | --- | --- | --- |
-| `--token`, `--atlassian-token` | `ATLASSIAN_TOKEN` | Organization API bearer token |
-| `-o`, `--org` | `ATLASSIAN_ORG` | Organization ID |
-| `--site` | `ATLASSIAN_SITE` | Jira site base URL |
-| `--jira-email` | `JIRA_EMAIL` | Jira account email |
-| `--jira-pat` | `JIRA_PAT` | Jira API token |
+| `ATLASSIAN_TOKEN` | `--token`, `--atlassian-token` | Organization API key |
+| `ATLASSIAN_ORG` | `-o`, `--org` | Organization ID |
+| `ATLASSIAN_SITE` | `-s`, `--site` | Jira site hostname or URL |
+| `JIRA_EMAIL` | `--jira-email` | Jira service-account email |
+| `JIRA_PAT` | `--jira-pat` | Jira API token |
 
-All five settings are required. The Organization bearer token is sent only to
-the Organization API; Jira requests use Jira Basic authentication.
+`--site` accepts a hostname or an HTTP(S) URL. HTTPS is assumed when the
+scheme is omitted.
 
-## Target selection
+## Usage
 
-Choose exactly one service-desk selector:
-
-- `-s`, `--service-desk-id`: one service desk ID.
-- `-p`, `--project-key`: resolve one project key to its service desk.
-- `--all-service-desks`: every service desk available to the Jira account.
-
-By default, the script checks whether each customer has any issues for which
-they are reporter or creator. Customers with no matching issues are candidates.
-Because the issue search requests at most one result, the report shows `0` or
-`1+` for this check rather than presenting a partial result as an exact count.
-`--input-file` accepts a CSV or newline-delimited list of account IDs/emails;
-when supplied, matching customers are targeted without an issue search.
-`-f`, `--exclude-file` (also `--filename`) accepts a CSV allow list of account
-IDs/emails and always takes precedence over the target list.
-
-Before making a customer a candidate, the script confirms the organization
-directory and Jira profile identify a person account without billable or Jira
-product access, and checks complete Jira application-role and group data for
-roles or administrator membership. Missing or ambiguous account data is
-skipped.
-
-## Examples
-
-Dry run against one service desk (explicitly opt in to dry-run mode):
+Set credentials in PowerShell:
 
 ```powershell
 $env:ATLASSIAN_TOKEN = "organization-api-key"
 $env:ATLASSIAN_ORG = "organization-id"
-$env:ATLASSIAN_SITE = "https://your-site.atlassian.net"
+$env:ATLASSIAN_SITE = "your-site.atlassian.net"
 $env:JIRA_EMAIL = "you@example.com"
 $env:JIRA_PAT = "jira-api-token"
-python .\AtlRevokeUnverifiedCustomers.py --service-desk-id 12 --dry-run
 ```
 
-Dry run for a project or all service desks:
+Run against one service desk, a project, or all service desks:
 
 ```powershell
-python .\AtlRevokeUnverifiedCustomers.py --project-key HELP --dry-run
-python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --exclude-file .\allow-list.csv --dry-run
+python .\AtlRevokeUnverifiedCustomers.py -d 12 --dry-run
+python .\AtlRevokeUnverifiedCustomers.py -p HELP --dry-run
+python .\AtlRevokeUnverifiedCustomers.py -s your-site.atlassian.net --all-service-desks --dry-run
 ```
 
-Target only IDs/emails in an input file:
+Target only listed account IDs/emails, while excluding an allow-list:
 
 ```powershell
-python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --input-file .\targets.csv --dry-run
+python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --input-file .\targets.csv -f .\allow-list.csv --dry-run
 ```
 
-Perform removal against one service desk (live mode is the default):
+After reviewing a dry-run report, omit `--dry-run` to remove access:
 
 ```powershell
-python .\AtlRevokeUnverifiedCustomers.py --service-desk-id 12
+python .\AtlRevokeUnverifiedCustomers.py -d 12
 ```
 
-Each run prints per-customer decisions and a summary, and creates a uniquely
-named CSV report in the current directory. Without `--dry-run`, customers are
-removed from the selected service desk(s); no Atlassian account is deleted or
-deactivated.
+## Options
+
+- `-s`, `--site`: Jira site hostname or URL (env: `ATLASSIAN_SITE`).
+- `-d`, `--service-desk-id`: process one service desk by ID.
+- `-p`, `--project-key`: resolve a project key to its service desk.
+- `--all-service-desks`: process every available service desk.
+- `--token`, `--atlassian-token`: Organization API key (env: `ATLASSIAN_TOKEN`).
+- `-o`, `--org`: Organization ID (env: `ATLASSIAN_ORG`).
+- `--jira-email`: Jira service-account email (env: `JIRA_EMAIL`).
+- `--jira-pat`: Jira API token (env: `JIRA_PAT`).
+- `--input-file PATH`: CSV or newline-delimited IDs/emails to target instead
+  of checking issue activity.
+- `-f`, `--exclude-file PATH` (alias `--filename`): CSV allow-list of IDs or
+  emails to skip; exclusions take precedence over the input list.
+- `--dry-run`: preview decisions without removing customers. Live execution
+  is the default.
+- `--out PATH`: write the CSV report to this path. Existing files are never
+  overwritten. By default, a unique timestamped filename is generated.
+
+## Output
+
+The script prints each customer’s email, display name, account ID, service
+desk, issue activity, action, and reason, followed by a summary of desks
+processed, customers scanned, candidates, would-remove/removed totals, skips,
+and errors. `WARN`, `SUCCESS`, and `ERROR` labels and action statuses use color
+in interactive terminals and respect `NO_COLOR`.
+
+The CSV report contains these columns:
+
+| Column | Description |
+| --- | --- |
+| `email` | Customer email address |
+| `display_name` | Customer display name |
+| `account_id` | Atlassian account ID |
+| `service_desk` | Service-desk name |
+| `issues_count` | `0`, `1+`, or why issue activity was not checked |
+| `action` | `would remove`, `removed`, `skipped`, or `error` |
+| `reason` | Explanation for a skipped or failed action |
+
+Issue searches request at most one matching issue, so `issues_count` is
+reported as `0` or `1+`, not as an exact count. In live mode the script
+removes customer access from the selected service desk(s) only. It never
+deletes or deactivates Atlassian accounts.
+
+Transient read-only GET failures (HTTP 429 and common 5xx responses) are
+retried with bounded backoff. Removal requests are never automatically retried.

@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
-"""Find inactive JSM portal customers and optionally remove service-desk access."""
+"""AtlRevokeUnverifiedCustomers.py
+
+Remove inactive JSM portal customers from selected service desks. Live removal
+is the default; use --dry-run to preview changes.
+
+Environment variables:
+- ATLASSIAN_TOKEN / ATLASSIAN_ORG: Organization directory access
+- ATLASSIAN_SITE / JIRA_EMAIL / JIRA_PAT: Jira site API access
+"""
 
 import argparse
 import base64
 import csv
 import json
+import math
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,6 +28,8 @@ from typing import Any
 ORG_API_BASE = "https://api.atlassian.com/admin/v1"
 PAGE_SIZE = 100
 REMOVE_BATCH_SIZE = 50
+MAX_READ_RETRIES = 3
+RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 REPORT_COLUMNS = (
     "email",
     "display_name",
@@ -27,6 +39,10 @@ REPORT_COLUMNS = (
     "action",
     "reason",
 )
+ANSI_RESET = "\033[0m"
+ANSI_RED = "\033[31m"
+ANSI_YELLOW = "\033[33m"
+ANSI_GREEN = "\033[32m"
 
 
 class ApiError(Exception):
@@ -34,6 +50,37 @@ class ApiError(Exception):
         super().__init__(message)
         self.api = api
         self.status = status
+
+
+def _print_status(label: str, message: str, color: str, *, stream: Any) -> None:
+    if "NO_COLOR" not in os.environ and stream.isatty():
+        label = f"{color}{label}{ANSI_RESET}"
+    print(f"{label}: {message}", file=stream)
+
+
+def warn(message: str) -> None:
+    _print_status("WARN", message, ANSI_YELLOW, stream=sys.stderr)
+
+
+def success(message: str) -> None:
+    _print_status("SUCCESS", message, ANSI_GREEN, stream=sys.stdout)
+
+
+def log_error(message: str) -> None:
+    _print_status("ERROR", message, ANSI_RED, stream=sys.stderr)
+
+
+def _retry_delay(attempt: int, response: urllib.error.HTTPError | None = None) -> float:
+    if response is not None and response.headers is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                seconds = float(retry_after)
+                if math.isfinite(seconds):
+                    return min(max(seconds, 0), 30)
+            except ValueError:
+                pass
+    return min(0.5 * (2**attempt), 5)
 
 
 def request_json(
@@ -52,14 +99,31 @@ def request_json(
     request = urllib.request.Request(
         url, data=payload, headers=request_headers, method=method
     )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            response_body = response.read()
-    except urllib.error.HTTPError as error:
-        raise ApiError(api, f"HTTP {error.code}", error.code) from None
-    except (urllib.error.URLError, TimeoutError) as error:
-        reason = error.reason if isinstance(error, urllib.error.URLError) else error
-        raise ApiError(api, f"request failed: {reason}") from None
+    retryable = method.upper() == "GET"
+    for attempt in range(MAX_READ_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                response_body = response.read()
+            break
+        except urllib.error.HTTPError as http_error:
+            if (
+                retryable
+                and http_error.code in RETRYABLE_STATUSES
+                and attempt < MAX_READ_RETRIES
+            ):
+                time.sleep(_retry_delay(attempt, http_error))
+                continue
+            raise ApiError(api, f"HTTP {http_error.code}", http_error.code) from None
+        except (urllib.error.URLError, TimeoutError) as request_error:
+            if retryable and attempt < MAX_READ_RETRIES:
+                time.sleep(_retry_delay(attempt))
+                continue
+            reason = (
+                request_error.reason
+                if isinstance(request_error, urllib.error.URLError)
+                else request_error
+            )
+            raise ApiError(api, f"request failed: {reason}") from None
 
     if not response_body:
         return {}
@@ -172,8 +236,15 @@ def resolve_config(args: argparse.Namespace) -> dict[str, str]:
     }
     missing = [key for key, value in config.items() if not value.strip()]
     if missing:
+        option_names = {
+            "token": "--token",
+            "org": "-o/--org",
+            "site": "-s/--site",
+            "jira_email": "--jira-email",
+            "jira_pat": "--jira-pat",
+        }
         details = ", ".join(
-            f"--{key.replace('_', '-')} / {sources[key][1]}" for key in missing
+            f"{option_names[key]} / {sources[key][1]}" for key in missing
         )
         raise ValueError(f"missing required credentials/settings: {details}")
 
@@ -345,7 +416,15 @@ def customer_url(config: dict[str, str], service_desk_id: str) -> str:
     )
 
 
-def write_report(rows: list[dict[str, str]]) -> Path:
+def write_report(rows: list[dict[str, str]], output_path: str | None = None) -> Path:
+    if output_path:
+        path = Path(output_path)
+        with path.open("x", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=REPORT_COLUMNS)
+            writer.writeheader()
+            writer.writerows(rows)
+        return path
+
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     base = Path(f"customer-revocation-report-{timestamp}")
     for suffix in range(1000):
@@ -362,14 +441,28 @@ def write_report(rows: list[dict[str, str]]) -> Path:
 
 
 def print_row(row: dict[str, str]) -> None:
+    action = row["action"]
+    colors = {"removed": ANSI_GREEN, "would remove": ANSI_YELLOW, "error": ANSI_RED}
+    if action in colors and "NO_COLOR" not in os.environ and sys.stdout.isatty():
+        action = f"{colors[action]}{action}{ANSI_RESET}"
     print(
         f"{row['email']} | {row['display_name']} | {row['account_id']} | "
         f"{row['service_desk']} | {row['issues_count']} | "
-        f"{row['action']}{': ' + row['reason'] if row['reason'] else ''}"
+        f"{action}{': ' + row['reason'] if row['reason'] else ''}"
     )
 
 
 def process(args: argparse.Namespace, config: dict[str, str]) -> int:
+    if args.out:
+        report_path = Path(args.out)
+        if report_path.exists():
+            raise ValueError(
+                f"report file already exists and will not be overwritten: {args.out}"
+            )
+        if not report_path.parent.is_dir():
+            raise ValueError(f"report directory does not exist: {report_path.parent}")
+    if args.dry_run:
+        warn("Dry-run mode: no service-desk access will be changed.")
     input_mode = args.input_file is not None
     input_ids = read_identifiers(args.input_file)
     excluded_ids = read_identifiers(args.exclude_file)
@@ -401,6 +494,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                 "reason": "",
             }
             if not account_id:
+                row["action"] = "error"
                 row["reason"] = "customer record has no account ID"
                 error_count += 1
                 rows.append(row)
@@ -430,6 +524,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
             except ApiError as error:
                 if error.status in {401, 403}:
                     raise
+                row["action"] = "error"
                 row["issues_count"] = "not checked"
                 row["reason"] = f"Jira profile check failed ({error})"
                 error_count += 1
@@ -457,7 +552,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
     if input_ids:
         missing_inputs = input_ids - requested_matches
         for identifier in sorted(missing_inputs):
-            print(f"ERROR: input target was not found in selected service desks: {identifier}", file=sys.stderr)
+            log_error(f"Input target was not found in selected service desks: {identifier}")
             error_count += 1
 
     candidates_by_desk: dict[str, list[tuple[dict[str, str], str, str]]] = {}
@@ -488,40 +583,80 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                     for row, _, _ in batch:
                         row["action"] = "error"
                         row["reason"] = reason
+                    log_error(
+                        f"{reason} for {len(batch)} customers in service desk {desk_id}"
+                    )
                 else:
                     for row, _, _ in batch:
                         row["action"] = "removed"
+                    success(f"Removed {len(batch)} customers from service desk {desk_id}")
             rows.extend(row for row, _, _ in batch)
 
     for row in rows:
         print_row(row)
-    report_path = write_report(rows)
-    candidates_count = sum(row["action"] in {"would remove", "removed", "error"} for row in rows)
-    removed_count = sum(row["action"] == "removed" for row in rows)
-    skipped_count = sum(row["action"] == "skipped" for row in rows)
-    print(
-        f"Summary: customers scanned={len(rows)}, stale candidates={candidates_count}, "
-        f"removed={removed_count}, skipped={skipped_count}, errors={error_count}"
+    report_path = write_report(rows, args.out)
+    candidates_count = sum(
+        row["action"] in {"would remove", "removed"}
+        or (
+            row["action"] == "error"
+            and row["issues_count"] in {"0", "not checked (input list)"}
+        )
+        for row in rows
     )
-    print(f"CSV report: {report_path}")
+    removed_count = sum(row["action"] == "removed" for row in rows)
+    would_remove_count = sum(row["action"] == "would remove" for row in rows)
+    skipped_count = sum(row["action"] == "skipped" for row in rows)
+    print("Summary:")
+    print(f"  Service desks processed: {len(desks)}")
+    print(f"  Customers scanned: {len(rows)}")
+    print(f"  Stale candidates: {candidates_count}")
+    print(f"  Would remove: {would_remove_count}")
+    print(f"  Removed: {removed_count}")
+    print(f"  Skipped: {skipped_count}")
+    print(f"  Errors: {error_count}")
+    success(f"CSV report written to {report_path}")
     return 1 if error_count else 0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Find inactive JSM portal customers; removals are live unless --dry-run is set."
+        description="Remove inactive JSM portal customers from service desks."
     )
-    parser.add_argument("--token", "--atlassian-token", dest="token")
-    parser.add_argument("-o", "--org")
-    parser.add_argument("--site")
-    parser.add_argument("--jira-email")
-    parser.add_argument("--jira-pat")
+    parser.add_argument(
+        "--token",
+        "--atlassian-token",
+        dest="token",
+        help="Organization API key (env: ATLASSIAN_TOKEN)",
+    )
+    parser.add_argument("-o", "--org", help="Organization ID (env: ATLASSIAN_ORG)")
+    parser.add_argument(
+        "-s",
+        "--site",
+        help="Atlassian site hostname or URL (env: ATLASSIAN_SITE)",
+    )
+    parser.add_argument(
+        "--jira-email", help="Jira service account email (env: JIRA_EMAIL)"
+    )
+    parser.add_argument("--jira-pat", help="Jira API token (env: JIRA_PAT)")
     target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("-s", "--service-desk-id")
-    target.add_argument("-p", "--project-key")
-    target.add_argument("--all-service-desks", action="store_true")
+    target.add_argument(
+        "-d",
+        "--service-desk-id",
+        help="Process one service desk by ID",
+    )
+    target.add_argument(
+        "-p",
+        "--project-key",
+        help="Resolve a project key to its service desk",
+    )
+    target.add_argument(
+        "--all-service-desks",
+        action="store_true",
+        help="Process every available service desk",
+    )
     parser.add_argument(
         "--input-file",
+        metavar="PATH",
         help="CSV or text list of account IDs/emails to target instead of checking issue activity",
     )
     parser.add_argument(
@@ -529,12 +664,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--exclude-file",
         "--filename",
         dest="exclude_file",
+        metavar="PATH",
         help="CSV allow list of account IDs/emails to skip",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="report customers without removing service-desk access",
+    )
+    parser.add_argument(
+        "--out",
+        metavar="PATH",
+        help="CSV report path (default: unique timestamped filename)",
     )
     return parser.parse_args(argv)
 
@@ -545,7 +686,7 @@ def main(argv: list[str] | None = None) -> int:
         config = resolve_config(args)
         return process(args, config)
     except ValueError as error:
-        print(f"ERROR: {error}", file=sys.stderr)
+        log_error(str(error))
         return 2
     except ApiError as error:
         if error.status in {401, 403}:
@@ -562,10 +703,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
         else:
             message = f"{error.api.capitalize()} API error: {error}"
-        print(f"ERROR: {message}", file=sys.stderr)
+        log_error(message)
         return 2
     except OSError as error:
-        print(f"ERROR: {error}", file=sys.stderr)
+        log_error(str(error))
         return 2
 
 

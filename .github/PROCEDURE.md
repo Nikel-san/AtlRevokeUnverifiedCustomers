@@ -114,8 +114,8 @@ command-line options. Command-line values take precedence:
 | Command-line option | Environment variable | Purpose |
 | --- | --- | --- |
 | `--token` / `--atlassian-token` | `ATLASSIAN_TOKEN` | Organization API bearer token |
-| `--org` / `-o` | `ATLASSIAN_ORG` | Organization ID |
-| `--site` | `ATLASSIAN_SITE` | Jira site base URL; HTTPS is assumed if omitted |
+| `-o` / `--org` | `ATLASSIAN_ORG` | Organization ID |
+| `-s` / `--site` | `ATLASSIAN_SITE` | Jira site base URL; HTTPS is assumed if omitted |
 | `--jira-email` | `JIRA_EMAIL` | Jira account email |
 | `--jira-pat` | `JIRA_PAT` | Jira API token |
 
@@ -125,14 +125,14 @@ cause a clear error and exit code 2.
 
 ## Selection and review
 
-Select one target with `--service-desk-id` (`-s`), `--project-key` (`-p`), or
+Select one target with `-d` / `--service-desk-id`, `-p` / `--project-key`, or
 `--all-service-desks`. By default, the script paginates through service-desk
 customers and Jira issues, identifying portal customers with no issues where
 they are reporter or creator. The Jira account must be able to browse all
 relevant projects for this check to be complete.
 
 An optional `--input-file` selects only listed account IDs/emails and skips
-issue searches. `--exclude-file` (aliases `--filename` and `-f`) is a CSV
+issue searches. `-f` / `--exclude-file` (alias `--filename`) is a CSV
 allow list and overrides inclusion in the input file. The script skips
 accounts unless directory and Jira profile data confirm a person with no
 billable/Jira product access, no Jira application roles, and no administrator
@@ -145,13 +145,20 @@ decisions and timestamped CSV report without making changes. Reports are
 created in the current directory and are never overwritten.
 
 ```powershell
-python .\AtlRevokeUnverifiedCustomers.py --service-desk-id 12 --dry-run
-python .\AtlRevokeUnverifiedCustomers.py --project-key HELP --dry-run
-python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --exclude-file .\allow-list.csv --dry-run
+python .\AtlRevokeUnverifiedCustomers.py -d 12 --dry-run
+python .\AtlRevokeUnverifiedCustomers.py -p HELP --dry-run
+python .\AtlRevokeUnverifiedCustomers.py --all-service-desks -f .\allow-list.csv --dry-run
 python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --input-file .\targets.csv --dry-run
-python .\AtlRevokeUnverifiedCustomers.py --service-desk-id 12
+python .\AtlRevokeUnverifiedCustomers.py -d 12
 ```
 
 Without `--dry-run`, the script batches customer removals through the JSM
 service-desk customer endpoint. It does not call any account deletion or
 deactivation endpoint.
+
+Use `-s` / `--site` for the Jira site hostname or URL (`ATLASSIAN_SITE`).
+`--out PATH` selects a CSV report path; existing files are never overwritten.
+Without it, a unique timestamped report filename is generated. The console
+prints each customer decision and a summary; color labels are limited to
+interactive terminals and respect `NO_COLOR`. Transient GET failures are
+retried with bounded backoff; removals are never automatically retried.
