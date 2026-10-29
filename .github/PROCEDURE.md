@@ -102,7 +102,7 @@ These patterns waste tokens and violate credit-efficiency rules:
 
 # Customer access cleanup procedure
 
-This repository contains `revoke_customers.py`, which identifies inactive JSM
+This repository contains `AtlRevokeUnverifiedCustomers.py`, which identifies inactive JSM
 portal customers and can remove their access from selected service desks.
 Atlassian accounts are never deleted or deactivated.
 
@@ -145,11 +145,11 @@ decisions and timestamped CSV report before approving a live run. Reports
 are created in the current directory and are never overwritten.
 
 ```powershell
-python .\revoke_customers.py --service-desk-id 12
-python .\revoke_customers.py --project-key HELP
-python .\revoke_customers.py --all-service-desks --exclude-file .\allow-list.csv
-python .\revoke_customers.py --all-service-desks --input-file .\targets.csv
-python .\revoke_customers.py --service-desk-id 12 --live
+python .\AtlRevokeUnverifiedCustomers.py --service-desk-id 12
+python .\AtlRevokeUnverifiedCustomers.py --project-key HELP
+python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --exclude-file .\allow-list.csv
+python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --input-file .\targets.csv
+python .\AtlRevokeUnverifiedCustomers.py --service-desk-id 12 --live
 ```
 
 Live mode batches customer removals through the JSM service-desk customer

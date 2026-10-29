@@ -1,6 +1,6 @@
 # Atlassian JSM customer access cleanup
 
-`revoke_customers.py` finds JSM portal customers with no issues reported or
+`AtlRevokeUnverifiedCustomers.py` finds JSM portal customers with no issues reported or
 created, or targets only the accounts in an explicitly supplied input list.
 It removes access from service desks only; it never deletes or deactivates
 Atlassian accounts. The default is a dry run.
@@ -63,26 +63,26 @@ $env:ATLASSIAN_ORG = "organization-id"
 $env:ATLASSIAN_SITE = "https://your-site.atlassian.net"
 $env:JIRA_EMAIL = "you@example.com"
 $env:JIRA_PAT = "jira-api-token"
-python .\revoke_customers.py --service-desk-id 12
+python .\AtlRevokeUnverifiedCustomers.py --service-desk-id 12
 ```
 
 Dry run for a project, or all service desks:
 
 ```powershell
-python .\revoke_customers.py --project-key HELP
-python .\revoke_customers.py --all-service-desks --exclude-file .\allow-list.csv
+python .\AtlRevokeUnverifiedCustomers.py --project-key HELP
+python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --exclude-file .\allow-list.csv
 ```
 
 Target only IDs/emails in an input file:
 
 ```powershell
-python .\revoke_customers.py --all-service-desks --input-file .\targets.csv
+python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --input-file .\targets.csv
 ```
 
 Perform removal after reviewing the dry-run report:
 
 ```powershell
-python .\revoke_customers.py --service-desk-id 12 --live
+python .\AtlRevokeUnverifiedCustomers.py --service-desk-id 12 --live
 ```
 
 Each run prints per-customer decisions and a summary, and creates a uniquely
