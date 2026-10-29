@@ -23,7 +23,7 @@ the `https://` scheme; HTTPS is assumed when omitted.
 | Option | Environment variable | Purpose |
 | --- | --- | --- |
 | `--token`, `--atlassian-token` | `ATLASSIAN_TOKEN` | Organization API bearer token |
-| `--org`, `-o` | `ATLASSIAN_ORG` | Organization ID |
+| `-o`, `--org` | `ATLASSIAN_ORG` | Organization ID |
 | `--site` | `ATLASSIAN_SITE` | Jira site base URL |
 | `--jira-email` | `JIRA_EMAIL` | Jira account email |
 | `--jira-pat` | `JIRA_PAT` | Jira API token |
@@ -35,8 +35,8 @@ the Organization API; Jira requests use Jira Basic authentication.
 
 Choose exactly one service-desk selector:
 
-- `--service-desk-id`, `-s`: one service desk ID.
-- `--project-key`, `-p`: resolve one project key to its service desk.
+- `-s`, `--service-desk-id`: one service desk ID.
+- `-p`, `--project-key`: resolve one project key to its service desk.
 - `--all-service-desks`: every service desk available to the Jira account.
 
 By default, the script checks whether each customer has any issues for which
@@ -45,7 +45,7 @@ Because the issue search requests at most one result, the report shows `0` or
 `1+` for this check rather than presenting a partial result as an exact count.
 `--input-file` accepts a CSV or newline-delimited list of account IDs/emails;
 when supplied, matching customers are targeted without an issue search.
-`--exclude-file` (also `--filename`, `-f`) accepts a CSV allow list of account
+`-f`, `--exclude-file` (also `--filename`) accepts a CSV allow list of account
 IDs/emails and always takes precedence over the target list.
 
 Before making a customer a candidate, the script confirms the organization

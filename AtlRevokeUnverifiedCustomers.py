@@ -512,22 +512,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Find inactive JSM portal customers; removals are live unless --dry-run is set."
     )
     parser.add_argument("--token", "--atlassian-token", dest="token")
-    parser.add_argument("--org", "-o")
+    parser.add_argument("-o", "--org")
     parser.add_argument("--site")
     parser.add_argument("--jira-email")
     parser.add_argument("--jira-pat")
     target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("--service-desk-id", "-s")
-    target.add_argument("--project-key", "-p")
+    target.add_argument("-s", "--service-desk-id")
+    target.add_argument("-p", "--project-key")
     target.add_argument("--all-service-desks", action="store_true")
     parser.add_argument(
         "--input-file",
         help="CSV or text list of account IDs/emails to target instead of checking issue activity",
     )
     parser.add_argument(
+        "-f",
         "--exclude-file",
         "--filename",
-        "-f",
         dest="exclude_file",
         help="CSV allow list of account IDs/emails to skip",
     )
