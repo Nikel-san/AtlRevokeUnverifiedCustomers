@@ -159,8 +159,10 @@ def paginated_values(
         values.extend(page_values)
 
         links = page.get("links")
-        next_url = links.get("next") if isinstance(links, dict) else None
-        if next_url:
+        if isinstance(links, dict):
+            next_url = links.get("next")
+            if not next_url:
+                break
             next_url = urllib.parse.urljoin(current_url, next_url)
             parsed_next_url = urllib.parse.urlparse(next_url)
             if next_link_host and (
