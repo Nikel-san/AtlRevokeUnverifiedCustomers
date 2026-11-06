@@ -127,9 +127,9 @@ cause a clear error and exit code 2.
 
 Select one target with `-d` / `--service-desk-id`, `-p` / `--project-key`, or
 `--all-service-desks`. By default, the script paginates through service-desk
-customers and Jira issues, identifying portal customers with no issues where
-they are reporter or creator. The Jira account must be able to browse all
-relevant projects for this check to be complete.
+customers and removes only accounts whose status is `invited` (unverified email
+/ never logged in). Active or verified customers are preserved even when they
+have no Jira tickets.
 
 Portal-only accounts identified by a `qm:` account ID are treated as
 `customer` accounts directly and do not require an Organization directory
@@ -139,14 +139,12 @@ their Jira profile. `accountType=customer` is also treated as portal-only;
 product-access, and Jira role/group checks. Atlassian accounts missing from
 the Organization directory remain skipped.
 
-An optional `--input-file` selects only listed account IDs/emails and skips
-issue searches. `-f` / `--exclude-file` (alias `--filename`) is a CSV
+An optional `--input-file` selects only listed account IDs/emails for explicit
+review and removal. `-f` / `--exclude-file` (alias `--filename`) is a CSV
 allow list and overrides inclusion in the input file. The script skips
 accounts unless directory and Jira profile data confirm a person with no
 billable/Jira product access, no Jira application roles, and no administrator
 group membership. Incomplete role or group data is skipped.
-Issue-search reports show `0` or `1+` because the check only requests one
-matching issue.
 
 Runs remove access by default. Pass `--dry-run` to inspect the console
 decisions and timestamped CSV report without making changes. Reports are
@@ -165,7 +163,9 @@ service-desk customer endpoint. It does not call any account deletion or
 deactivation endpoint.
 
 Console and CSV output include the account type (`customer`, `atlassian`, or
-the Jira profile's reported type) alongside the customer and action details.
+the Jira profile's reported type) and the customer status (`invited`,
+`active`, or the endpoint-reported state) alongside the customer and action
+details.
 
 Use `-s` / `--site` for the Jira site hostname or URL (`ATLASSIAN_SITE`).
 `--out PATH` selects a CSV report path; existing files are never overwritten.

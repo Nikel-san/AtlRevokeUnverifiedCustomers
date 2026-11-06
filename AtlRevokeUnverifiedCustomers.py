@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """AtlRevokeUnverifiedCustomers.py
 
-Remove inactive JSM portal customers from selected service desks. Live removal
+Remove invited JSM portal customers from selected service desks. Live removal
 is the default; use --dry-run to preview changes.
 
 Environment variables:
@@ -36,7 +36,7 @@ REPORT_COLUMNS = (
     "account_id",
     "account_type",
     "service_desk",
-    "issues_count",
+    "status",
     "action",
     "reason",
 )
@@ -400,21 +400,38 @@ def is_portal_only(
     return True, ""
 
 
-def has_issues(config: dict[str, str], account_id: str) -> bool:
-    escaped_id = account_id.replace("\\", "\\\\").replace('"', '\\"')
-    jql = f'reporter = "{escaped_id}" OR creator = "{escaped_id}"'
-    query = urllib.parse.urlencode(
-        {"jql": jql, "maxResults": 1, "fields": "key"}
-    )
-    result = request_json(
-        f"{config['site']}/rest/api/3/search/jql?{query}",
-        api="jira",
-        headers=jira_headers(config["jira_email"], config["jira_pat"]),
-    )
-    issues = result.get("issues")
-    if not isinstance(issues, list):
-        raise ApiError("jira", "issue search returned an invalid response")
-    return bool(issues)
+def normalize_customer_status(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip().casefold()
+    return ""
+
+
+def customer_status(customer: dict[str, Any]) -> str:
+    for key in (
+        "status",
+        "accountStatus",
+        "invitationStatus",
+        "customerStatus",
+        "portalStatus",
+    ):
+        value = normalize_customer_status(customer.get(key))
+        if value:
+            return value
+
+    active = customer.get("active")
+    if isinstance(active, bool):
+        return "active" if active else "invited"
+    return "unknown"
+
+
+def is_invited_customer(customer: dict[str, Any]) -> bool:
+    status = customer_status(customer)
+    if status in {"invited", "pending", "pending_invite", "pendinginvite", "unverified", "unverified_email", "not_verified", "notverified"}:
+        return True
+    if status in {"active", "verified", "logged_in", "loggedin", "accepted", "member", "enabled"}:
+        return False
+    active = customer.get("active")
+    return isinstance(active, bool) and not active
 
 
 def customer_url(config: dict[str, str], service_desk_id: str) -> str:
@@ -455,7 +472,7 @@ def print_row(row: dict[str, str]) -> None:
         action = f"{colors[action]}{action}{ANSI_RESET}"
     print(
         f"{row['email']} | {row['display_name']} | {row['account_id']} | "
-        f"{row['account_type']} | {row['service_desk']} | {row['issues_count']} | "
+        f"{row['account_type']} | {row['service_desk']} | {row['status']} | "
         f"{action}{': ' + row['reason'] if row['reason'] else ''}"
     )
 
@@ -474,7 +491,6 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
     input_mode = args.input_file is not None
     input_ids = read_identifiers(args.input_file)
     excluded_ids = read_identifiers(args.exclude_file)
-    org_users: dict[str, dict[str, Any]] | None = None
     desks = select_service_desks(args, load_service_desks(config))
     rows: list[dict[str, str]] = []
     requested_matches: set[str] = set()
@@ -492,6 +508,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
             email = str(customer.get("emailAddress") or "")
             name = str(customer.get("displayName") or "")
             match_keys = {key.casefold() for key in (account_id, email) if key}
+            status = customer_status(customer)
             row = {
                 "email": email,
                 "display_name": name,
@@ -500,7 +517,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                     "customer" if account_id.casefold().startswith("qm:") else "not checked"
                 ),
                 "service_desk": desk_name,
-                "issues_count": "",
+                "status": status,
                 "action": "skipped",
                 "reason": "",
             }
@@ -514,12 +531,12 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
             requested_matches.update(matched_inputs)
 
             if match_keys & excluded_ids:
-                row["issues_count"] = "not checked"
+                row["status"] = status or "not checked"
                 row["reason"] = "present in exclude list"
                 rows.append(row)
                 continue
             if input_mode and not matched_inputs:
-                row["issues_count"] = "not checked"
+                row["status"] = status or "not checked"
                 row["reason"] = "not present in input list"
                 rows.append(row)
                 continue
@@ -532,7 +549,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                     if error.status in {401, 403}:
                         raise
                     row["action"] = "error"
-                    row["issues_count"] = "not checked"
+                    row["status"] = status or "not checked"
                     row["reason"] = f"Jira profile check failed ({error})"
                     error_count += 1
                     rows.append(row)
@@ -541,32 +558,22 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                 if isinstance(profile_account_type, str):
                     row["account_type"] = profile_account_type.casefold()
 
-            org_user: dict[str, Any] | None = None
-            if row["account_type"] == "atlassian":
-                if org_users is None:
-                    org_users = load_org_users(config)
-                org_user = org_users.get(account_id.casefold())
-
-            portal_only, reason = is_portal_only(
-                row["account_type"], org_user, profile
-            )
-            if not portal_only:
-                row["issues_count"] = "not checked"
-                row["reason"] = reason
+            if row["account_type"] != "customer":
+                row["status"] = status or "not checked"
+                row["reason"] = "account is not a service-desk customer"
                 rows.append(row)
                 continue
 
             if input_mode:
-                row["issues_count"] = "not checked (input list)"
+                row["status"] = status or "not checked (input list)"
+                candidates.append((row, desk_id, account_id))
+            elif is_invited_customer(customer):
+                row["status"] = status or "invited"
                 candidates.append((row, desk_id, account_id))
             else:
-                if has_issues(config, account_id):
-                    row["issues_count"] = "1+"
-                    row["reason"] = "has reported or created Jira issues"
-                    rows.append(row)
-                else:
-                    row["issues_count"] = "0"
-                    candidates.append((row, desk_id, account_id))
+                row["status"] = status or "active"
+                row["reason"] = "customer is active or not in invited status"
+                rows.append(row)
 
     if input_ids:
         missing_inputs = input_ids - requested_matches
@@ -618,7 +625,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
         row["action"] in {"would remove", "removed"}
         or (
             row["action"] == "error"
-            and row["issues_count"] in {"0", "not checked (input list)"}
+            and row["status"] in {"invited", "not checked (input list)"}
         )
         for row in rows
     )
@@ -639,7 +646,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Remove inactive JSM portal customers from service desks."
+        description="Remove invited JSM portal customers from service desks."
     )
     parser.add_argument(
         "--token",
@@ -676,7 +683,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--input-file",
         metavar="PATH",
-        help="CSV or text list of account IDs/emails to target instead of checking issue activity",
+        help="CSV or text list of account IDs/emails to target explicitly",
     )
     parser.add_argument(
         "-f",
