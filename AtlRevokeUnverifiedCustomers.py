@@ -326,13 +326,61 @@ def select_service_desks(
     return selected
 
 
-def list_customers(
-    config: dict[str, str], service_desk_id: str
-) -> list[dict[str, Any]]:
-    query = urllib.parse.urlencode({"start": 0, "limit": 50})
+def resolve_service_desk_project_id(
+    config: dict[str, str], service_desk_id: str, service_desk: dict[str, Any] | None = None
+) -> str:
+    if service_desk is not None:
+        project_id = service_desk.get("projectId")
+        if project_id not in (None, ""):
+            return str(project_id)
+        project = service_desk.get("project")
+        if isinstance(project, dict):
+            project_id = project.get("id") or project.get("projectId")
+            if project_id not in (None, ""):
+                return str(project_id)
+
     url = (
         f"{config['site']}/rest/servicedeskapi/servicedesk/"
-        f"{urllib.parse.quote(service_desk_id, safe='')}/customer?{query}"
+        f"{urllib.parse.quote(service_desk_id, safe='')}"
+    )
+    service_desk = request_json(
+        url,
+        api="jira",
+        headers=jira_headers(config["jira_email"], config["jira_pat"]),
+    )
+    project_id = service_desk.get("projectId")
+    if project_id not in (None, ""):
+        return str(project_id)
+    project = service_desk.get("project")
+    if isinstance(project, dict):
+        project_id = project.get("id") or project.get("projectId")
+        if project_id not in (None, ""):
+            return str(project_id)
+
+    project_key = service_desk.get("projectKey")
+    if isinstance(project_key, str) and project_key:
+        project = request_json(
+            f"{config['site']}/rest/api/3/project/{urllib.parse.quote(project_key, safe='')}",
+            api="jira",
+            headers=jira_headers(config["jira_email"], config["jira_pat"]),
+        )
+        project_id = project.get("id")
+        if project_id not in (None, ""):
+            return str(project_id)
+
+    raise ApiError("jira", "service desk does not expose a project ID for contact discovery")
+
+
+def list_customers(
+    config: dict[str, str], service_desk_id: str, project_id: str | None = None
+) -> list[dict[str, Any]]:
+    resolved_project_id = project_id or resolve_service_desk_project_id(
+        config, service_desk_id
+    )
+    query = urllib.parse.urlencode({"start": 0, "limit": 100})
+    url = (
+        f"{config['site']}/rest/servicedesk/1/project/"
+        f"{urllib.parse.quote(str(resolved_project_id), safe='')}/contacts?{query}"
     )
     headers = jira_headers(config["jira_email"], config["jira_pat"])
     headers["X-ExperimentalApi"] = "opt-in"
@@ -416,7 +464,10 @@ def customer_status(customer: dict[str, Any]) -> str:
         "contactStatus",
         "contact_status",
         "verificationStatus",
+        "loggedInStatus",
+        "logged_in_status",
         "loginStatus",
+        "login_status",
     ):
         value = normalize_customer_status(customer.get(key))
         if value:
@@ -430,6 +481,8 @@ def customer_status(customer: dict[str, Any]) -> str:
 
 def is_invited_customer(customer: dict[str, Any]) -> bool:
     status = customer_status(customer)
+    if isinstance(customer.get("agent"), bool) and customer.get("agent") is True:
+        return False
     invited_statuses = {
         "invited",
         "pending",
@@ -531,20 +584,27 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
         desk_name = str(desk.get("projectName") or desk.get("projectKey") or desk_id)
         if not desk_id:
             raise ApiError("jira", "service desk response did not contain an ID")
-        customers = list_customers(config, desk_id)
+        customers = list_customers(
+            config,
+            desk_id,
+            project_id=(
+                str(desk.get("projectId"))
+                if desk.get("projectId") not in (None, "")
+                else None
+            ),
+        )
         for customer in customers:
-            account_id = str(customer.get("accountId") or "")
-            email = str(customer.get("emailAddress") or "")
+            account_id = str(customer.get("identifier") or customer.get("accountId") or "")
+            email = str(customer.get("email") or customer.get("emailAddress") or "")
             name = str(customer.get("displayName") or "")
+            agent = customer.get("agent")
             match_keys = {key.casefold() for key in (account_id, email) if key}
             status = customer_status(customer)
             row = {
                 "email": email,
                 "display_name": name,
                 "account_id": account_id,
-                "account_type": (
-                    "customer" if account_id.casefold().startswith("qm:") else "not checked"
-                ),
+                "account_type": "customer" if not agent else "agent",
                 "service_desk": desk_name,
                 "status": status,
                 "action": "skipped",
@@ -570,38 +630,21 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                 rows.append(row)
                 continue
 
-            profile: dict[str, Any] | None = None
-            if row["account_type"] != "customer":
-                try:
-                    profile = jira_user_profile(config, account_id)
-                except ApiError as error:
-                    if error.status in {401, 403}:
-                        raise
-                    row["action"] = "error"
-                    row["status"] = status or "not checked"
-                    row["reason"] = f"Jira profile check failed ({error})"
-                    error_count += 1
-                    rows.append(row)
-                    continue
-                profile_account_type = profile.get("accountType")
-                if isinstance(profile_account_type, str):
-                    row["account_type"] = profile_account_type.casefold()
-
-            if row["account_type"] != "customer":
-                row["status"] = status or "not checked"
-                row["reason"] = "account is not a service-desk customer"
+            if isinstance(agent, bool) and agent:
+                row["status"] = status or "agent"
+                row["reason"] = "contact is an agent and not a customer"
                 rows.append(row)
                 continue
 
             if input_mode:
                 row["status"] = status or "not checked (input list)"
                 candidates.append((row, desk_id, account_id))
-            elif is_invited_customer(customer):
-                row["status"] = status or "invited"
+            elif status == "pending_login" and is_invited_customer(customer):
+                row["status"] = status or "pending_login"
                 candidates.append((row, desk_id, account_id))
             else:
-                row["status"] = status or "active"
-                row["reason"] = "customer is active or not in invited status"
+                row["status"] = status or "logged_in"
+                row["reason"] = "contact is active or not in pending-login status"
                 rows.append(row)
 
     if input_ids:
