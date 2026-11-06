@@ -492,8 +492,9 @@ def list_customers(
     headers["X-ExperimentalApi"] = "opt-in"
 
     start = 0
-    limit = 100
+    limit = 50
     contacts: list[dict[str, Any]] = []
+
     while True:
         query = urllib.parse.urlencode({"start": start, "limit": limit})
         url = (
@@ -504,9 +505,13 @@ def list_customers(
 
         if isinstance(page, list):
             page_values = page
-            metadata: dict[str, Any] | None = None
+            metadata: dict[str, Any] = {}
         elif isinstance(page, dict):
-            metadata = page.get("contactPageMetadata")
+            metadata = (
+                page.get("contactPageMetadata")
+                if isinstance(page.get("contactPageMetadata"), dict)
+                else {}
+            )
             page_values = None
             for key in ("contactResults", "values", "data", "items", "results", "contacts"):
                 candidate = page.get(key)
@@ -521,11 +526,9 @@ def list_customers(
                             break
                     if isinstance(page_values, list):
                         break
-            if page_values is None and isinstance(metadata, dict):
-                page_values = []
         else:
             page_values = None
-            metadata = None
+            metadata = {}
 
         if not isinstance(page_values, list):
             keys = sorted(page.keys()) if isinstance(page, dict) else type(page).__name__
@@ -542,34 +545,16 @@ def list_customers(
 
         contacts.extend(page_values)
 
-        page_size = limit
-        if isinstance(metadata, dict):
-            for key in ("pageSize", "limit", "size", "count"):
-                value = metadata.get(key)
-                if isinstance(value, int) and value > 0:
-                    page_size = value
-                    break
-            total = metadata.get("total")
-            if isinstance(total, int) and total > 0:
-                if start + len(page_values) >= total:
-                    break
-        else:
-            total = None
-
-        next_token = None
-        if isinstance(page, dict):
-            next_token = page.get("nextPageToken") or (
-                metadata.get("nextPageToken") if isinstance(metadata, dict) else None
-            )
-        if next_token:
-            if isinstance(next_token, str):
-                start = start + len(page_values)
-            else:
-                start = start + len(page_values)
-            continue
-
-        if len(page_values) < page_size:
+        if metadata.get("isLastPage") is True:
             break
+
+        total = metadata.get("total")
+        if isinstance(total, int) and total > 0 and len(contacts) >= total:
+            break
+
+        if len(page_values) < limit:
+            break
+
         start += len(page_values)
 
     return contacts
