@@ -494,6 +494,8 @@ def list_customers(
     start = 0
     limit = 50
     contacts: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    is_tty = sys.stderr.isatty()
 
     while True:
         query = urllib.parse.urlencode({"start": start, "limit": limit})
@@ -543,20 +545,39 @@ def list_customers(
         if not page_values:
             break
 
-        contacts.extend(page_values)
+        new_items = 0
+        for item in page_values:
+            if not isinstance(item, dict):
+                continue
+            identifier = str(item.get("identifier") or item.get("accountId") or "")
+            if identifier and identifier in seen_ids:
+                continue
+            if identifier:
+                seen_ids.add(identifier)
+            contacts.append(item)
+            new_items += 1
+
+        total = metadata.get("total")
+        total_str = f"/{total}" if isinstance(total, int) and total > 0 else ""
+        if is_tty:
+            sys.stderr.write(f"\rScanning contacts: {len(contacts)}{total_str} fetched...")
+            sys.stderr.flush()
+        elif len(contacts) % 500 == 0:
+            sys.stderr.write(f"Scanning contacts: {len(contacts)}{total_str} fetched...\n")
 
         if metadata.get("isLastPage") is True:
             break
 
-        total = metadata.get("total")
         if isinstance(total, int) and total > 0 and len(contacts) >= total:
             break
-
-        if len(page_values) < limit:
+        if len(page_values) < limit or new_items == 0:
             break
 
         start += len(page_values)
 
+    if is_tty:
+        sys.stderr.write("\n")
+        sys.stderr.flush()
     return contacts
 
 
@@ -845,6 +866,8 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
     for candidate in candidates:
         candidates_by_desk.setdefault(candidate[1], []).append(candidate)
     for desk_id, desk_candidates in candidates_by_desk.items():
+        total_revocations = len(desk_candidates)
+        processed_revocations = 0
         for index in range(0, len(desk_candidates), REMOVE_BATCH_SIZE):
             batch = desk_candidates[index : index + REMOVE_BATCH_SIZE]
             for row, _, _ in batch:
@@ -863,6 +886,12 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                         method="DELETE",
                         body={"accountIds": account_ids},
                     )
+                    processed_revocations += len(batch)
+                    if sys.stderr.isatty():
+                        sys.stderr.write(
+                            f"\rRevoking access: {processed_revocations}/{total_revocations}..."
+                        )
+                        sys.stderr.flush()
                 except ApiError as error:
                     error_count += len(batch)
                     reason = f"removal failed ({error})"
@@ -877,6 +906,9 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                         row["action"] = "removed"
                     success(f"Removed {len(batch)} customers from service desk {desk_id}")
             rows.extend(row for row, _, _ in batch)
+        if sys.stderr.isatty():
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
     for row in rows:
         print_row(row)
