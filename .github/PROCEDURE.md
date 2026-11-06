@@ -127,9 +127,9 @@ cause a clear error and exit code 2.
 
 Select one target with `-d` / `--service-desk-id`, `-p` / `--project-key`, or
 `--all-service-desks`. By default, the script paginates through service-desk
-customers and removes only accounts whose status is `invited` (unverified email
-/ never logged in). Active or verified customers are preserved even when they
-have no Jira tickets.
+customers and removes only accounts whose customer/contact status indicates a
+pending login or invitation (`invited`, `PENDING_LOGIN`, etc.). Active or
+verified customers are preserved even when they have no Jira tickets.
 
 Portal-only accounts identified by a `qm:` account ID are treated as
 `customer` accounts directly and do not require an Organization directory
@@ -164,8 +164,8 @@ deactivation endpoint.
 
 Console and CSV output include the account type (`customer`, `atlassian`, or
 the Jira profile's reported type) and the customer status (`invited`,
-`active`, or the endpoint-reported state) alongside the customer and action
-details.
+`PENDING_LOGIN`, `active`, or the endpoint-reported state) alongside the
+customer and action details.
 
 Use `-s` / `--site` for the Jira site hostname or URL (`ATLASSIAN_SITE`).
 `--out PATH` selects a CSV report path; existing files are never overwritten.

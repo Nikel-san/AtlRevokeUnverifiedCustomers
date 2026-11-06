@@ -413,6 +413,10 @@ def customer_status(customer: dict[str, Any]) -> str:
         "invitationStatus",
         "customerStatus",
         "portalStatus",
+        "contactStatus",
+        "contact_status",
+        "verificationStatus",
+        "loginStatus",
     ):
         value = normalize_customer_status(customer.get(key))
         if value:
@@ -420,15 +424,40 @@ def customer_status(customer: dict[str, Any]) -> str:
 
     active = customer.get("active")
     if isinstance(active, bool):
-        return "active" if active else "invited"
+        return "active" if active else "pending_login"
     return "unknown"
 
 
 def is_invited_customer(customer: dict[str, Any]) -> bool:
     status = customer_status(customer)
-    if status in {"invited", "pending", "pending_invite", "pendinginvite", "unverified", "unverified_email", "not_verified", "notverified"}:
+    invited_statuses = {
+        "invited",
+        "pending",
+        "pending_login",
+        "pendinglogin",
+        "pending-login",
+        "pending_invite",
+        "pendinginvite",
+        "pending_invitation",
+        "unverified",
+        "unverified_email",
+        "not_verified",
+        "notverified",
+    }
+    active_statuses = {
+        "active",
+        "verified",
+        "logged_in",
+        "loggedin",
+        "accepted",
+        "member",
+        "enabled",
+        "logged-in",
+        "verified_email",
+    }
+    if status in invited_statuses:
         return True
-    if status in {"active", "verified", "logged_in", "loggedin", "accepted", "member", "enabled"}:
+    if status in active_statuses:
         return False
     active = customer.get("active")
     return isinstance(active, bool) and not active

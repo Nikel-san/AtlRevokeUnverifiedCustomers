@@ -1,9 +1,10 @@
 # AtlRevokeUnverifiedCustomers
 
-Remove unverified/invited JSM portal customers from one or every Atlassian
-service desk. Customers are targeted based on their service-desk invitation
-status rather than their ticket history, and access is removed from service
-desks only; Atlassian accounts are never deleted or deactivated.
+Remove unverified JSM portal customers from one or every Atlassian service
+desk. Customers are targeted by the customer/contact status that indicates
+pending login or invitation (`invited` / `PENDING_LOGIN`), not by ticket
+history, and access is removed from service desks only; Atlassian accounts are
+never deleted or deactivated.
 JSM portal-only accounts (`qm:` IDs or Jira `accountType=customer`) are
 identified directly and do not require an Organization directory record.
 
@@ -105,7 +106,7 @@ The CSV report contains these columns:
 | `account_id` | Atlassian account ID |
 | `account_type` | `customer`, `atlassian`, or the profile-reported account type |
 | `service_desk` | Service-desk name |
-| `status` | Invite/customer status such as `invited` or `active` |
+| `status` | Customer/contact status such as `invited`, `PENDING_LOGIN`, or `active` |
 | `action` | `would remove`, `removed`, `skipped`, or `error` |
 | `reason` | Explanation for a skipped or failed action |
 
