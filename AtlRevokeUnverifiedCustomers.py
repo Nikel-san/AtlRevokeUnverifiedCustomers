@@ -488,14 +488,61 @@ def list_customers(
     resolved_project_id = project_id or resolve_service_desk_project_id(
         config, service_desk_id
     )
-    query = urllib.parse.urlencode({"start": 0, "limit": 100})
-    url = (
-        f"{config['site']}/rest/servicedesk/1/project/"
-        f"{urllib.parse.quote(str(resolved_project_id), safe='')}/contacts?{query}"
-    )
     headers = jira_headers(config["jira_email"], config["jira_pat"])
     headers["X-ExperimentalApi"] = "opt-in"
-    return paginated_values(url, api="jira", headers=headers)
+
+    start = 0
+    limit = 100
+    contacts: list[dict[str, Any]] = []
+    while True:
+        query = urllib.parse.urlencode({"start": start, "limit": limit})
+        url = (
+            f"{config['site']}/rest/servicedesk/1/project/"
+            f"{urllib.parse.quote(str(resolved_project_id), safe='')}/contacts?{query}"
+        )
+        page = request_json(url, api="jira", headers=headers)
+
+        if isinstance(page, list):
+            page_values = page
+        elif isinstance(page, dict):
+            page_values = None
+            for key in ("contactResults", "values", "data", "items", "results", "contacts"):
+                candidate = page.get(key)
+                if isinstance(candidate, list):
+                    page_values = candidate
+                    break
+                if isinstance(candidate, dict):
+                    for nested_key in ("values", "items", "results", "contacts"):
+                        nested = candidate.get(nested_key)
+                        if isinstance(nested, list):
+                            page_values = nested
+                            break
+                    if isinstance(page_values, list):
+                        break
+            if page_values is None and isinstance(page.get("contactPageMetadata"), dict):
+                page_values = []
+        else:
+            page_values = None
+
+        if not isinstance(page_values, list):
+            keys = sorted(page.keys()) if isinstance(page, dict) else type(page).__name__
+            raise ApiError(
+                api="jira",
+                message=(
+                    "response did not contain the expected contact list; "
+                    f"received {type(page).__name__} with keys={keys}"
+                ),
+            )
+
+        if not page_values:
+            break
+
+        contacts.extend(page_values)
+        if len(page_values) < limit:
+            break
+        start += len(page_values)
+
+    return contacts
 
 
 def jira_user_profile(
