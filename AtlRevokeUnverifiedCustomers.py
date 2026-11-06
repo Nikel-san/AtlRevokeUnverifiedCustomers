@@ -137,6 +137,31 @@ def request_json(
     return result
 
 
+def _find_list_of_dicts(value: Any) -> list[dict[str, Any]] | None:
+    if isinstance(value, list):
+        if all(isinstance(item, dict) for item in value):
+            return value
+        return None
+    if isinstance(value, dict):
+        for key in (
+            "values",
+            "data",
+            "items",
+            "results",
+            "contactResults",
+            "contacts",
+        ):
+            candidate = value.get(key)
+            found = _find_list_of_dicts(candidate)
+            if found is not None:
+                return found
+        for nested in value.values():
+            found = _find_list_of_dicts(nested)
+            if found is not None:
+                return found
+    return None
+
+
 def paginated_values(
     url: str,
     *,
@@ -155,15 +180,16 @@ def paginated_values(
 
         if isinstance(page, list):
             page_values = page
-        elif isinstance(page, dict):
-            page_values = None
-            for key in ("values", "data", "items", "results"):
-                candidate = page.get(key)
-                if isinstance(candidate, list):
-                    page_values = candidate
-                    break
         else:
-            page_values = None
+            page_values = _find_list_of_dicts(page)
+
+        if not isinstance(page_values, list):
+            keys = sorted(page.keys()) if isinstance(page, dict) else type(page).__name__
+            raise ApiError(
+                api,
+                "response did not contain a customer/user list; "
+                f"received {type(page).__name__} with keys={keys}",
+            )
 
         if not isinstance(page_values, list):
             keys = sorted(page.keys()) if isinstance(page, dict) else type(page).__name__
@@ -191,13 +217,15 @@ def paginated_values(
             current_url = next_url
             continue
 
-        if page.get("isLastPage") is True if isinstance(page, dict) else False:
+        if isinstance(page, dict) and page.get("isLastPage") is True:
+            break
+        if not page_values:
             break
         start = page.get("start") if isinstance(page, dict) else None
         limit = page.get("limit") if isinstance(page, dict) else None
         if isinstance(start, int) and isinstance(limit, int) and limit > 0:
-            if len(page_values) == 0:
-                raise ApiError(api, "pagination stopped before the last page")
+            if len(page_values) < limit:
+                break
             query = urllib.parse.urlparse(current_url).query
             params = urllib.parse.parse_qs(query)
             params["start"] = [str(start + limit)]
@@ -212,7 +240,11 @@ def paginated_values(
             next_url = urllib.parse.urljoin(current_url, str(page["next"]))
             current_url = next_url
             continue
-        raise ApiError(api, "response did not indicate whether more pages exist")
+        if isinstance(page, dict) and page.get("nextPageToken"):
+            next_url = urllib.parse.urljoin(current_url, str(page["nextPageToken"]))
+            current_url = next_url
+            continue
+        break
     return values
 
 
