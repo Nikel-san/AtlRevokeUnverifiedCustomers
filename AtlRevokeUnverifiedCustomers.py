@@ -91,7 +91,7 @@ def request_json(
     headers: dict[str, str],
     method: str = "GET",
     body: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | list[Any]:
     request_headers = {"Accept": "application/json", **headers}
     payload = None
     if body is not None:
@@ -132,7 +132,7 @@ def request_json(
         result = json.loads(response_body)
     except json.JSONDecodeError as error:
         raise ApiError(api, f"server returned invalid JSON: {error}") from None
-    if not isinstance(result, dict):
+    if not isinstance(result, (dict, list)):
         raise ApiError(api, "server returned an unexpected response")
     return result
 
@@ -152,14 +152,31 @@ def paginated_values(
             raise ApiError(api, "pagination returned a repeated page link")
         seen_urls.add(current_url)
         page = request_json(current_url, api=api, headers=headers)
-        page_values = page.get("values", page.get("data"))
+
+        if isinstance(page, list):
+            page_values = page
+        elif isinstance(page, dict):
+            page_values = None
+            for key in ("values", "data", "items", "results"):
+                candidate = page.get(key)
+                if isinstance(candidate, list):
+                    page_values = candidate
+                    break
+        else:
+            page_values = None
+
         if not isinstance(page_values, list):
-            raise ApiError(api, "response did not contain a customer/user list")
+            keys = sorted(page.keys()) if isinstance(page, dict) else type(page).__name__
+            raise ApiError(
+                api,
+                "response did not contain a customer/user list; "
+                f"received {type(page).__name__} with keys={keys}",
+            )
         if not all(isinstance(item, dict) for item in page_values):
             raise ApiError(api, "response contained an invalid list item")
         values.extend(page_values)
 
-        links = page.get("links")
+        links = page.get("links") if isinstance(page, dict) else None
         if isinstance(links, dict):
             next_url = links.get("next")
             if not next_url:
@@ -174,10 +191,10 @@ def paginated_values(
             current_url = next_url
             continue
 
-        if page.get("isLastPage") is True:
+        if page.get("isLastPage") is True if isinstance(page, dict) else False:
             break
-        start = page.get("start")
-        limit = page.get("limit")
+        start = page.get("start") if isinstance(page, dict) else None
+        limit = page.get("limit") if isinstance(page, dict) else None
         if isinstance(start, int) and isinstance(limit, int) and limit > 0:
             if len(page_values) == 0:
                 raise ApiError(api, "pagination stopped before the last page")
@@ -190,6 +207,10 @@ def paginated_values(
                     query=urllib.parse.urlencode(params, doseq=True)
                 )
             )
+            continue
+        if isinstance(page, dict) and page.get("next"):
+            next_url = urllib.parse.urljoin(current_url, str(page["next"]))
+            current_url = next_url
             continue
         raise ApiError(api, "response did not indicate whether more pages exist")
     return values
@@ -295,6 +316,64 @@ def load_service_desks(config: dict[str, str]) -> list[dict[str, Any]]:
         api="jira",
         headers=jira_headers(config["jira_email"], config["jira_pat"]),
     )
+
+
+def resolve_service_desk_for_project(
+    config: dict[str, str], project_key: str
+) -> list[dict[str, Any]]:
+    project = request_json(
+        f"{config['site']}/rest/api/3/project/{urllib.parse.quote(project_key, safe='')}",
+        api="jira",
+        headers=jira_headers(config["jira_email"], config["jira_pat"]),
+    )
+    project_id = project.get("id")
+    desk_url = (
+        f"{config['site']}/rest/servicedeskapi/project/"
+        f"{urllib.parse.quote(project_key, safe='')}/serviceDesk"
+    )
+    try:
+        desk = request_json(
+            desk_url,
+            api="jira",
+            headers=jira_headers(config["jira_email"], config["jira_pat"]),
+        )
+    except ApiError:
+        desk = None
+
+    normalized: list[dict[str, Any]] = []
+    if isinstance(desk, dict):
+        normalized.append(
+            {
+                **desk,
+                "projectKey": project_key,
+                "projectId": desk.get("projectId") or project_id,
+                "projectName": desk.get("projectName") or project.get("name") or project_key,
+            }
+        )
+    elif isinstance(desk, list):
+        for item in desk:
+            if isinstance(item, dict):
+                normalized.append(
+                    {
+                        **item,
+                        "projectKey": project_key,
+                        "projectId": item.get("projectId") or project_id,
+                        "projectName": item.get("projectName") or item.get("name") or project_key,
+                    }
+                )
+
+    if normalized:
+        return normalized
+
+    service_desks = load_service_desks(config)
+    selected = [
+        desk
+        for desk in service_desks
+        if str(desk.get("projectKey", "")).casefold() == project_key.casefold()
+    ]
+    if not selected:
+        raise ValueError(f"no service desk found for project {project_key}")
+    return selected
 
 
 def select_service_desks(
@@ -573,7 +652,22 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
     input_mode = args.input_file is not None
     input_ids = read_identifiers(args.input_file)
     excluded_ids = read_identifiers(args.exclude_file)
-    desks = select_service_desks(args, load_service_desks(config))
+    if args.all_service_desks:
+        desks = load_service_desks(config)
+    elif args.service_desk_id:
+        desk_url = (
+            f"{config['site']}/rest/servicedeskapi/servicedesk/"
+            f"{urllib.parse.quote(args.service_desk_id, safe='')}"
+        )
+        desks = [
+            request_json(
+                desk_url,
+                api="jira",
+                headers=jira_headers(config["jira_email"], config["jira_pat"]),
+            )
+        ]
+    else:
+        desks = resolve_service_desk_for_project(config, args.project_key)
     rows: list[dict[str, str]] = []
     requested_matches: set[str] = set()
     candidates: list[tuple[dict[str, str], str, str]] = []
