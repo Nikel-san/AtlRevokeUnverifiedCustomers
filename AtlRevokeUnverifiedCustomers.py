@@ -632,39 +632,32 @@ def list_customers(
     report_progress(total)
 
     if len(first_values) >= CONTACT_PAGE_SIZE:
-        if isinstance(total, int) and total > CONTACT_PAGE_SIZE:
-            offsets = range(CONTACT_PAGE_SIZE, total, CONTACT_PAGE_SIZE)
-            next_start = CONTACT_PAGE_SIZE
-            page_values = first_values
-            new_items = len(first_values)
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=CONTACT_PAGE_WORKERS
-            ) as executor:
-                for start, page in zip(offsets, executor.map(fetch_page, offsets)):
-                    page_values, _ = _parse_contact_page(page)
-                    new_items = add_contacts(page_values)
-                    report_progress(total)
-                    next_start = start + len(page_values)
+        start = CONTACT_PAGE_SIZE
+        page, _ = _parse_contact_page(fetch_page(start))
+        page_values = page
+        new_items = add_contacts(page_values)
+        report_progress(total)
+        start += len(page_values)
 
-            if len(page_values) >= CONTACT_PAGE_SIZE and new_items:
-                while True:
-                    page, _ = _parse_contact_page(fetch_page(next_start))
-                    page_values = page
-                    new_items = add_contacts(page_values)
-                    report_progress(total)
-                    if len(page_values) < CONTACT_PAGE_SIZE or new_items == 0:
-                        break
-                    next_start += len(page_values)
-        else:
-            start = len(first_values)
-            page_values = first_values
-            while len(page_values) >= CONTACT_PAGE_SIZE:
+        if len(page_values) >= CONTACT_PAGE_SIZE and new_items:
+            if isinstance(total, int) and total > start:
+                offsets = range(start, total, CONTACT_PAGE_SIZE)
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=CONTACT_PAGE_WORKERS
+                ) as executor:
+                    for page_start, page in zip(
+                        offsets, executor.map(fetch_page, offsets)
+                    ):
+                        page_values, _ = _parse_contact_page(page)
+                        new_items = add_contacts(page_values)
+                        report_progress(total)
+                        start = page_start + len(page_values)
+
+            while len(page_values) >= CONTACT_PAGE_SIZE and new_items:
                 page, _ = _parse_contact_page(fetch_page(start))
                 page_values = page
                 new_items = add_contacts(page_values)
                 report_progress(total)
-                if len(page_values) < CONTACT_PAGE_SIZE or new_items == 0:
-                    break
                 start += len(page_values)
 
     if is_tty:

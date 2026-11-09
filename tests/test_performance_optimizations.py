@@ -38,16 +38,22 @@ class PerformanceOptimizationTests(unittest.TestCase):
             offset = int(url.split("start=")[1].split("&")[0])
             with lock:
                 requested_offsets.append(offset)
-            if offset:
+            if offset in {100, 150}:
                 barrier.wait(timeout=2)
             start = offset
-            end = 50 if offset == 0 else (100 if offset == 50 else 120)
+            end = {
+                0: 50,
+                50: 100,
+                100: 150,
+                150: 200,
+                200: 220,
+            }.get(offset, offset)
             contacts = [{"identifier": f"user-{index}"} for index in range(start, end)]
             if offset == 100:
                 contacts.insert(0, {"identifier": "user-99"})
             result = {"contactResults": contacts}
             if offset == 0:
-                result["contactPageMetadata"] = {"total": 120}
+                result["contactPageMetadata"] = {"total": 220}
             return result
 
         config = {
@@ -58,9 +64,40 @@ class PerformanceOptimizationTests(unittest.TestCase):
         with mock.patch.object(app, "request_json", side_effect=fake_request):
             contacts = app.list_customers(config, "12", project_id="34")
 
-        self.assertCountEqual(requested_offsets, [0, 50, 100])
-        self.assertEqual(len(contacts), 120)
-        self.assertEqual(len({contact["identifier"] for contact in contacts}), 120)
+        self.assertCountEqual(requested_offsets, [0, 50, 100, 150, 200])
+        self.assertEqual(len(contacts), 220)
+        self.assertEqual(len({contact["identifier"] for contact in contacts}), 220)
+
+    def test_contact_pages_continue_when_first_page_metadata_claims_last_page(self) -> None:
+        requested_offsets: list[int] = []
+
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            offset = int(url.split("start=")[1].split("&")[0])
+            requested_offsets.append(offset)
+            end = {0: 50, 50: 100, 100: 103}.get(offset, offset)
+            result = {
+                "contactResults": [
+                    {"identifier": f"user-{index}"}
+                    for index in range(offset, end)
+                ]
+            }
+            if offset == 0:
+                result["contactPageMetadata"] = {
+                    "total": 50,
+                    "isLastPage": True,
+                }
+            return result
+
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            contacts = app.list_customers(config, "12", project_id="34")
+
+        self.assertEqual(requested_offsets, [0, 50, 100])
+        self.assertEqual(len(contacts), 103)
 
     def test_contact_pages_without_total_keep_sequential_fallback(self) -> None:
         requested_offsets: list[int] = []
