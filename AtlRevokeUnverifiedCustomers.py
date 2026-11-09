@@ -11,15 +11,16 @@ Environment variables:
 
 import argparse
 import base64
+import concurrent.futures
 import csv
+import http.client
 import json
 import math
 import os
 import sys
+import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,9 @@ from typing import Any
 ORG_API_BASE = "https://api.atlassian.com/admin/v1"
 PAGE_SIZE = 100
 REMOVE_BATCH_SIZE = 50
+CONTACT_PAGE_SIZE = 50
+CONTACT_PAGE_WORKERS = 4
+REQUEST_TIMEOUT = 30
 MAX_READ_RETRIES = 3
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 REPORT_COLUMNS = (
@@ -44,6 +48,9 @@ ANSI_RESET = "\033[0m"
 ANSI_RED = "\033[31m"
 ANSI_YELLOW = "\033[33m"
 ANSI_GREEN = "\033[32m"
+_connection_local = threading.local()
+_connections: set[http.client.HTTPConnection] = set()
+_connections_lock = threading.Lock()
 
 
 class ApiError(Exception):
@@ -71,9 +78,9 @@ def log_error(message: str) -> None:
     _print_status("ERROR", message, ANSI_RED, stream=sys.stderr)
 
 
-def _retry_delay(attempt: int, response: urllib.error.HTTPError | None = None) -> float:
-    if response is not None and response.headers is not None:
-        retry_after = response.headers.get("Retry-After")
+def _retry_delay(attempt: int, headers: Any = None) -> float:
+    if headers is not None:
+        retry_after = headers.get("Retry-After")
         if retry_after:
             try:
                 seconds = float(retry_after)
@@ -84,6 +91,47 @@ def _retry_delay(attempt: int, response: urllib.error.HTTPError | None = None) -
     return min(0.5 * (2**attempt), 5)
 
 
+def _get_connection(
+    scheme: str, host: str, port: int | None
+) -> http.client.HTTPConnection:
+    connections = getattr(_connection_local, "connections", None)
+    if connections is None:
+        connections = {}
+        _connection_local.connections = connections
+    key = (scheme, host, port)
+    connection = connections.get(key)
+    if connection is None:
+        connection_type = http.client.HTTPConnection
+        if scheme == "https":
+            connection_type = http.client.HTTPSConnection
+        connection = connection_type(host, port=port, timeout=REQUEST_TIMEOUT)
+        connections[key] = connection
+        with _connections_lock:
+            _connections.add(connection)
+    return connection
+
+
+def _discard_connection(
+    scheme: str, host: str, port: int | None, connection: http.client.HTTPConnection
+) -> None:
+    connections = getattr(_connection_local, "connections", {})
+    key = (scheme, host, port)
+    if connections.get(key) is connection:
+        del connections[key]
+    with _connections_lock:
+        _connections.discard(connection)
+    connection.close()
+
+
+def _close_connections() -> None:
+    with _connections_lock:
+        connections = tuple(_connections)
+        _connections.clear()
+    for connection in connections:
+        connection.close()
+    getattr(_connection_local, "connections", {}).clear()
+
+
 def request_json(
     url: str,
     *,
@@ -92,39 +140,49 @@ def request_json(
     method: str = "GET",
     body: dict[str, Any] | None = None,
 ) -> dict[str, Any] | list[Any]:
+    parsed_url = urllib.parse.urlsplit(url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
+        raise ApiError(api, "request URL must be an absolute HTTP(S) URL")
+    host = parsed_url.hostname
+    port = parsed_url.port
+    request_path = urllib.parse.urlunsplit(
+        ("", "", parsed_url.path or "/", parsed_url.query, "")
+    )
     request_headers = {"Accept": "application/json", **headers}
-    payload = None
+    payload: bytes | None = None
     if body is not None:
         request_headers["Content-Type"] = "application/json"
         payload = json.dumps(body).encode("utf-8")
-    request = urllib.request.Request(
-        url, data=payload, headers=request_headers, method=method
-    )
     retryable = method.upper() == "GET"
     for attempt in range(MAX_READ_RETRIES + 1):
+        connection = _get_connection(parsed_url.scheme, host, port)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                response_body = response.read()
+            connection.request(
+                method.upper(),
+                request_path,
+                body=payload,
+                headers=request_headers,
+            )
+            response = connection.getresponse()
+            response_body = response.read()
+            if response.status >= 400:
+                if (
+                    retryable
+                    and response.status in RETRYABLE_STATUSES
+                    and attempt < MAX_READ_RETRIES
+                ):
+                    time.sleep(_retry_delay(attempt, response.headers))
+                    continue
+                raise ApiError(api, f"HTTP {response.status}", response.status)
             break
-        except urllib.error.HTTPError as http_error:
-            if (
-                retryable
-                and http_error.code in RETRYABLE_STATUSES
-                and attempt < MAX_READ_RETRIES
-            ):
-                time.sleep(_retry_delay(attempt, http_error))
-                continue
-            raise ApiError(api, f"HTTP {http_error.code}", http_error.code) from None
-        except (urllib.error.URLError, TimeoutError) as request_error:
+        except ApiError:
+            raise
+        except (http.client.HTTPException, OSError) as request_error:
+            _discard_connection(parsed_url.scheme, host, port, connection)
             if retryable and attempt < MAX_READ_RETRIES:
                 time.sleep(_retry_delay(attempt))
                 continue
-            reason = (
-                request_error.reason
-                if isinstance(request_error, urllib.error.URLError)
-                else request_error
-            )
-            raise ApiError(api, f"request failed: {reason}") from None
+            raise ApiError(api, f"request failed: {request_error}") from None
 
     if not response_body:
         return {}
@@ -484,6 +542,45 @@ def resolve_service_desk_project_id(
     raise ApiError("jira", "service desk does not expose a project ID for contact discovery")
 
 
+def _parse_contact_page(
+    page: dict[str, Any] | list[Any],
+) -> tuple[list[Any], dict[str, Any]]:
+    if isinstance(page, list):
+        page_values = page
+        metadata: dict[str, Any] = {}
+    else:
+        metadata = (
+            page.get("contactPageMetadata")
+            if isinstance(page.get("contactPageMetadata"), dict)
+            else {}
+        )
+        page_values = None
+        for key in ("contactResults", "values", "data", "items", "results", "contacts"):
+            candidate = page.get(key)
+            if isinstance(candidate, list):
+                page_values = candidate
+                break
+            if isinstance(candidate, dict):
+                for nested_key in ("values", "items", "results", "contacts"):
+                    nested = candidate.get(nested_key)
+                    if isinstance(nested, list):
+                        page_values = nested
+                        break
+                if isinstance(page_values, list):
+                    break
+
+    if not isinstance(page_values, list):
+        keys = sorted(page.keys()) if isinstance(page, dict) else type(page).__name__
+        raise ApiError(
+            api="jira",
+            message=(
+                "response did not contain the expected contact list; "
+                f"received {type(page).__name__} with keys={keys}"
+            ),
+        )
+    return page_values, metadata
+
+
 def list_customers(
     config: dict[str, str], service_desk_id: str, project_id: str | None = None
 ) -> list[dict[str, Any]]:
@@ -493,60 +590,21 @@ def list_customers(
     headers = jira_headers(config["jira_email"], config["jira_pat"])
     headers["X-ExperimentalApi"] = "opt-in"
 
-    start = 0
-    limit = 50
     contacts: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     is_tty = sys.stderr.isatty()
 
-    while True:
-        query = urllib.parse.urlencode({"start": start, "limit": limit})
+    def fetch_page(start: int) -> dict[str, Any] | list[Any]:
+        query = urllib.parse.urlencode({"start": start, "limit": CONTACT_PAGE_SIZE})
         url = (
             f"{config['site']}/rest/servicedesk/1/project/"
             f"{urllib.parse.quote(str(resolved_project_id), safe='')}/contacts?{query}"
         )
-        page = request_json(url, api="jira", headers=headers)
+        return request_json(url, api="jira", headers=headers)
 
-        if isinstance(page, list):
-            page_values = page
-            metadata: dict[str, Any] = {}
-        elif isinstance(page, dict):
-            metadata = (
-                page.get("contactPageMetadata")
-                if isinstance(page.get("contactPageMetadata"), dict)
-                else {}
-            )
-            page_values = None
-            for key in ("contactResults", "values", "data", "items", "results", "contacts"):
-                candidate = page.get(key)
-                if isinstance(candidate, list):
-                    page_values = candidate
-                    break
-                if isinstance(candidate, dict):
-                    for nested_key in ("values", "items", "results", "contacts"):
-                        nested = candidate.get(nested_key)
-                        if isinstance(nested, list):
-                            page_values = nested
-                            break
-                    if isinstance(page_values, list):
-                        break
-        else:
-            page_values = None
-            metadata = {}
-
-        if not isinstance(page_values, list):
-            keys = sorted(page.keys()) if isinstance(page, dict) else type(page).__name__
-            raise ApiError(
-                api="jira",
-                message=(
-                    "response did not contain the expected contact list; "
-                    f"received {type(page).__name__} with keys={keys}"
-                ),
-            )
-
+    def add_contacts(page_values: list[Any]) -> int:
         if not page_values:
-            break
-
+            return 0
         new_items = 0
         for item in page_values:
             if not isinstance(item, dict):
@@ -558,8 +616,9 @@ def list_customers(
                 seen_ids.add(identifier)
             contacts.append(item)
             new_items += 1
+        return new_items
 
-        total = metadata.get("total")
+    def report_progress(total: Any) -> None:
         total_str = f"/{total}" if isinstance(total, int) and total > 0 else ""
         if is_tty:
             sys.stderr.write(f"\rScanning contacts: {len(contacts)}{total_str} fetched...")
@@ -567,15 +626,33 @@ def list_customers(
         elif len(contacts) % 500 == 0:
             sys.stderr.write(f"Scanning contacts: {len(contacts)}{total_str} fetched...\n")
 
-        if metadata.get("isLastPage") is True:
-            break
+    first_values, first_metadata = _parse_contact_page(fetch_page(0))
+    add_contacts(first_values)
+    total = first_metadata.get("total")
+    report_progress(total)
 
-        if isinstance(total, int) and total > 0 and len(contacts) >= total:
-            break
-        if len(page_values) < limit or new_items == 0:
-            break
-
-        start += len(page_values)
+    if first_metadata.get("isLastPage") is not True:
+        if isinstance(total, int) and total > 0:
+            if len(contacts) < total:
+                offsets = range(CONTACT_PAGE_SIZE, total, CONTACT_PAGE_SIZE)
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=CONTACT_PAGE_WORKERS
+                ) as executor:
+                    for page in executor.map(fetch_page, offsets):
+                        page_values, _ = _parse_contact_page(page)
+                        add_contacts(page_values)
+                        report_progress(total)
+        else:
+            start = len(first_values)
+            page_values = first_values
+            while len(page_values) >= CONTACT_PAGE_SIZE:
+                page, _ = _parse_contact_page(fetch_page(start))
+                page_values = page
+                new_items = add_contacts(page_values)
+                report_progress(None)
+                if len(page_values) < CONTACT_PAGE_SIZE or new_items == 0:
+                    break
+                start += len(page_values)
 
     if is_tty:
         sys.stderr.write("\n")
@@ -979,6 +1056,8 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as error:
         log_error(str(error))
         return 2
+    finally:
+        _close_connections()
 
 
 if __name__ == "__main__":

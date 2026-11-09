@@ -122,4 +122,7 @@ override those safety checks. `LOGGED_IN`, missing/unknown statuses, agents,
 and contacts whose agent status is not explicitly `false` are skipped.
 
 Transient read-only GET failures (HTTP 429 and common 5xx responses) are
-retried with bounded backoff. Removal requests are never automatically retried.
+retried with bounded backoff. HTTPS connections are reused, and after the
+contact total is read, remaining 50-contact pages are fetched with up to four
+concurrent requests. Removal requests are never automatically retried and are
+sent in batches of 50.
