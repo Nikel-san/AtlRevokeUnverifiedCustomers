@@ -126,25 +126,18 @@ cause a clear error and exit code 2.
 ## Selection and review
 
 Select one target with `-d` / `--service-desk-id`, `-p` / `--project-key`, or
-`--all-service-desks`. By default, the script paginates through service-desk
-customers and removes only accounts whose customer/contact status indicates a
-pending login or invitation (`invited`, `PENDING_LOGIN`, etc.). Active or
-verified customers are preserved even when they have no Jira tickets.
+`--all-service-desks`. The script resolves each desk's project ID and
+discovers contacts through
+`GET /rest/servicedesk/1/project/{projectId}/contacts`, including pagination.
+Removal eligibility requires both `loggedInStatus: "PENDING_LOGIN"` and
+`agent: false`. `LOGGED_IN`, unknown/missing statuses, agents, and contacts
+without an explicit `agent: false` are skipped. No ticket-history, account
+deletion, or global deactivation logic is used.
 
-Portal-only accounts identified by a `qm:` account ID are treated as
-`customer` accounts directly and do not require an Organization directory
-record or Jira licensed-user/admin checks. Other accounts are checked through
-their Jira profile. `accountType=customer` is also treated as portal-only;
-`accountType=atlassian` must still pass Organization directory license,
-product-access, and Jira role/group checks. Atlassian accounts missing from
-the Organization directory remain skipped.
-
-An optional `--input-file` selects only listed account IDs/emails for explicit
-review and removal. `-f` / `--exclude-file` (alias `--filename`) is a CSV
-allow list and overrides inclusion in the input file. The script skips
-accounts unless directory and Jira profile data confirm a person with no
-billable/Jira product access, no Jira application roles, and no administrator
-group membership. Incomplete role or group data is skipped.
+An optional `--input-file` limits processing to listed account IDs/emails; it
+does not bypass the pending-login or customer-role checks. `-f` /
+`--exclude-file` (alias `--filename`) is a CSV allow list and takes precedence
+over inclusion in the input file.
 
 Runs remove access by default. Pass `--dry-run` to inspect the console
 decisions and timestamped CSV report without making changes. Reports are
@@ -162,9 +155,8 @@ Without `--dry-run`, the script batches customer removals through the JSM
 service-desk customer endpoint. It does not call any account deletion or
 deactivation endpoint.
 
-Console and CSV output include the account type (`customer`, `atlassian`, or
-the Jira profile's reported type) and the customer status (`invited`,
-`PENDING_LOGIN`, `active`, or the endpoint-reported state) alongside the
+Console and CSV output include the account type and contact `loggedInStatus`
+(`PENDING_LOGIN`, `LOGGED_IN`, or the endpoint-reported state) alongside the
 customer and action details.
 
 Use `-s` / `--site` for the Jira site hostname or URL (`ATLASSIAN_SITE`).

@@ -1,10 +1,10 @@
 # AtlRevokeUnverifiedCustomers
 
-Remove unverified JSM portal customers from one or every Atlassian service
-desk. Customers are targeted by the customer/contact status that indicates
-pending login or invitation (`invited` / `PENDING_LOGIN`), not by ticket
-history, and access is removed from service desks only; Atlassian accounts are
-never deleted or deactivated.
+Remove JSM portal customers with `loggedInStatus` exactly `PENDING_LOGIN` from
+one or every Atlassian service desk. A contact must also have `agent: false`.
+Logged-in customers and contacts without a confirmed customer role or pending
+login status are preserved. Access is removed from service desks only;
+Atlassian accounts are never deleted or deactivated.
 JSM portal-only accounts (`qm:` IDs or Jira `accountType=customer`) are
 identified directly and do not require an Organization directory record.
 
@@ -80,8 +80,9 @@ python .\AtlRevokeUnverifiedCustomers.py -d 12
 - `-o`, `--org`: Organization ID (env: `ATLASSIAN_ORG`).
 - `--jira-email`: Jira service-account email (env: `JIRA_EMAIL`).
 - `--jira-pat`: Jira API token (env: `JIRA_PAT`).
-- `--input-file PATH`: CSV or newline-delimited IDs/emails to target in
-  addition to the normal invited-status review.
+- `--input-file PATH`: CSV or newline-delimited IDs/emails to limit processing
+  to matching contacts; matches are still removed only when their
+  `loggedInStatus` is `PENDING_LOGIN` and `agent` is `false`.
 - `-f`, `--exclude-file PATH` (alias `--filename`): CSV allow-list of IDs or
   emails to skip; exclusions take precedence over the input list.
 - `--dry-run`: preview decisions without removing customers. Live execution
@@ -106,18 +107,19 @@ The CSV report contains these columns:
 | `account_id` | Atlassian account ID |
 | `account_type` | `customer`, `atlassian`, or the profile-reported account type |
 | `service_desk` | Service-desk name |
-| `status` | Customer/contact status such as `invited`, `PENDING_LOGIN`, or `active` |
+| `status` | Contact `loggedInStatus`, including `PENDING_LOGIN` or `LOGGED_IN` |
 | `action` | `would remove`, `removed`, `skipped`, or `error` |
 | `reason` | Explanation for a skipped or failed action |
 
 In live mode the script removes customer access from the selected service
 desk(s) only. It never deletes or deactivates Atlassian accounts.
 
-Portal-only `qm:` customers bypass Organization directory and licensed-user
-checks because they are customer accounts, not Organization directory users.
-Other accounts with Jira `accountType=customer` follow the same path.
-Atlassian accounts continue to require Organization directory and Jira
-role/group checks; missing directory records are skipped.
+Contacts are discovered through
+`GET /rest/servicedesk/1/project/{projectId}/contacts`. The script requires
+`loggedInStatus: "PENDING_LOGIN"` and `agent: false` before considering a
+contact for removal. `--input-file` narrows the contacts processed but cannot
+override those safety checks. `LOGGED_IN`, missing/unknown statuses, agents,
+and contacts whose agent status is not explicitly `false` are skipped.
 
 Transient read-only GET failures (HTTP 429 and common 5xx responses) are
 retried with bounded backoff. Removal requests are never automatically retried.

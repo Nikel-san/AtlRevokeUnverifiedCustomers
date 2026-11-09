@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """AtlRevokeUnverifiedCustomers.py
 
-Remove invited JSM portal customers from selected service desks. Live removal
-is the default; use --dry-run to preview changes.
+Remove JSM portal customers with PENDING_LOGIN status from selected service
+desks. Live removal is the default; use --dry-run to preview changes.
 
 Environment variables:
 - ATLASSIAN_TOKEN / ATLASSIAN_ORG: Organization directory access
@@ -369,7 +369,9 @@ def resolve_service_desk_for_project(
             api="jira",
             headers=jira_headers(config["jira_email"], config["jira_pat"]),
         )
-    except ApiError:
+    except ApiError as error:
+        if error.status not in {404, 405}:
+            raise
         desk = None
 
     normalized: list[dict[str, Any]] = []
@@ -649,65 +651,16 @@ def normalize_customer_status(value: Any) -> str:
 
 
 def customer_status(customer: dict[str, Any]) -> str:
-    for key in (
-        "status",
-        "accountStatus",
-        "invitationStatus",
-        "customerStatus",
-        "portalStatus",
-        "contactStatus",
-        "contact_status",
-        "verificationStatus",
-        "loggedInStatus",
-        "logged_in_status",
-        "loginStatus",
-        "login_status",
-    ):
-        value = normalize_customer_status(customer.get(key))
-        if value:
-            return value
-
-    active = customer.get("active")
-    if isinstance(active, bool):
-        return "active" if active else "pending_login"
-    return "unknown"
+    return normalize_customer_status(
+        customer.get("loggedInStatus") or customer.get("logged_in_status")
+    )
 
 
-def is_invited_customer(customer: dict[str, Any]) -> bool:
-    status = customer_status(customer)
-    if isinstance(customer.get("agent"), bool) and customer.get("agent") is True:
-        return False
-    invited_statuses = {
-        "invited",
-        "pending",
-        "pending_login",
-        "pendinglogin",
-        "pending-login",
-        "pending_invite",
-        "pendinginvite",
-        "pending_invitation",
-        "unverified",
-        "unverified_email",
-        "not_verified",
-        "notverified",
-    }
-    active_statuses = {
-        "active",
-        "verified",
-        "logged_in",
-        "loggedin",
-        "accepted",
-        "member",
-        "enabled",
-        "logged-in",
-        "verified_email",
-    }
-    if status in invited_statuses:
-        return True
-    if status in active_statuses:
-        return False
-    active = customer.get("active")
-    return isinstance(active, bool) and not active
+def customer_status_label(status: str) -> str:
+    return {
+        "pending_login": "PENDING_LOGIN",
+        "logged_in": "LOGGED_IN",
+    }.get(status, status or "unknown")
 
 
 def customer_url(config: dict[str, str], service_desk_id: str) -> str:
@@ -813,9 +766,15 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                 "email": email,
                 "display_name": name,
                 "account_id": account_id,
-                "account_type": "customer" if not agent else "agent",
+                "account_type": (
+                    "customer"
+                    if agent is False
+                    else "agent"
+                    if agent is True
+                    else "unknown"
+                ),
                 "service_desk": desk_name,
-                "status": status,
+                "status": customer_status_label(status),
                 "action": "skipped",
                 "reason": "",
             }
@@ -829,31 +788,30 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
             requested_matches.update(matched_inputs)
 
             if match_keys & excluded_ids:
-                row["status"] = status or "not checked"
                 row["reason"] = "present in exclude list"
                 rows.append(row)
                 continue
             if input_mode and not matched_inputs:
-                row["status"] = status or "not checked"
                 row["reason"] = "not present in input list"
                 rows.append(row)
                 continue
 
-            if isinstance(agent, bool) and agent:
-                row["status"] = status or "agent"
-                row["reason"] = "contact is an agent and not a customer"
+            if agent is not False:
+                row["reason"] = (
+                    "contact is an agent and not a customer"
+                    if agent is True
+                    else "contact agent status is missing or invalid"
+                )
                 rows.append(row)
                 continue
 
-            if input_mode:
-                row["status"] = status or "not checked (input list)"
+            if status == "pending_login":
                 candidates.append((row, desk_id, account_id))
-            elif status == "pending_login" and is_invited_customer(customer):
-                row["status"] = status or "pending_login"
-                candidates.append((row, desk_id, account_id))
+            elif status == "logged_in":
+                row["reason"] = "customer has logged in / active"
+                rows.append(row)
             else:
-                row["status"] = status or "logged_in"
-                row["reason"] = "contact is active or not in pending-login status"
+                row["reason"] = "contact is not in PENDING_LOGIN status"
                 rows.append(row)
 
     if input_ids:
@@ -913,14 +871,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
     for row in rows:
         print_row(row)
     report_path = write_report(rows, args.out)
-    candidates_count = sum(
-        row["action"] in {"would remove", "removed"}
-        or (
-            row["action"] == "error"
-            and row["status"] in {"invited", "not checked (input list)"}
-        )
-        for row in rows
-    )
+    candidates_count = len(candidates)
     removed_count = sum(row["action"] == "removed" for row in rows)
     would_remove_count = sum(row["action"] == "would remove" for row in rows)
     skipped_count = sum(row["action"] == "skipped" for row in rows)
@@ -938,7 +889,9 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Remove invited JSM portal customers from service desks."
+        description=(
+            "Remove PENDING_LOGIN JSM portal customers from service desks."
+        )
     )
     parser.add_argument(
         "--token",
@@ -975,7 +928,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--input-file",
         metavar="PATH",
-        help="CSV or text list of account IDs/emails to target explicitly",
+        help="CSV or text list limiting eligible PENDING_LOGIN customer IDs/emails",
     )
     parser.add_argument(
         "-f",
