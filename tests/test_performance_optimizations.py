@@ -1,3 +1,5 @@
+import contextlib
+import io
 import threading
 import unittest
 from unittest import mock
@@ -70,6 +72,7 @@ class PerformanceOptimizationTests(unittest.TestCase):
 
     def test_contact_pages_continue_when_first_page_metadata_claims_last_page(self) -> None:
         requested_offsets: list[int] = []
+        stderr = io.StringIO()
 
         def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
             offset = int(url.split("start=")[1].split("&")[0])
@@ -86,6 +89,11 @@ class PerformanceOptimizationTests(unittest.TestCase):
                     "total": 50,
                     "isLastPage": True,
                 }
+            elif offset == 50:
+                result["contactPageMetadata"] = {
+                    "total": 2,
+                    "isLastPage": False,
+                }
             return result
 
         config = {
@@ -93,11 +101,18 @@ class PerformanceOptimizationTests(unittest.TestCase):
             "jira_email": "user@example.test",
             "jira_pat": "not-used",
         }
-        with mock.patch.object(app, "request_json", side_effect=fake_request):
+        with (
+            mock.patch.object(app, "request_json", side_effect=fake_request),
+            contextlib.redirect_stderr(stderr),
+        ):
             contacts = app.list_customers(config, "12", project_id="34")
 
         self.assertEqual(requested_offsets, [0, 50, 100])
         self.assertEqual(len(contacts), 103)
+        self.assertIn("start=50 len(page_values)=50 new_items=50", stderr.getvalue())
+        self.assertIn(
+            "metadata={'total': 2, 'isLastPage': False}", stderr.getvalue()
+        )
 
     def test_contact_pages_without_total_keep_sequential_fallback(self) -> None:
         requested_offsets: list[int] = []

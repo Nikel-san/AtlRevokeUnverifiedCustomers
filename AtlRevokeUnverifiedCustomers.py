@@ -633,9 +633,21 @@ def list_customers(
 
     if len(first_values) >= CONTACT_PAGE_SIZE:
         start = CONTACT_PAGE_SIZE
-        page, _ = _parse_contact_page(fetch_page(start))
+        page_response = fetch_page(start)
+        page, page_metadata = _parse_contact_page(page_response)
         page_values = page
         new_items = add_contacts(page_values)
+        response_keys = (
+            sorted(page_response) if isinstance(page_response, dict) else None
+        )
+        print(
+            "DEBUG: contacts page "
+            f"start={start} len(page_values)={len(page_values)} "
+            f"new_items={new_items} metadata={page_metadata!r} "
+            f"response_type={type(page_response).__name__} "
+            f"response_keys={response_keys!r}",
+            file=sys.stderr,
+        )
         report_progress(total)
         start += len(page_values)
 
