@@ -704,7 +704,7 @@ def list_customers(
                 "identifier": account_id,
                 "accountType": "customer",
                 "agent": False,
-                "loggedInStatus": "PENDING_LOGIN",
+                "loggedInStatus": "UNKNOWN",
             }
             contact_cache[key] = contact
             return {**customer, **contact}
@@ -740,7 +740,7 @@ def list_customers(
                 "accountId": account_id,
                 "identifier": account_id,
                 "accountType": "customer" if is_customer_contact else (customer.get("accountType") or "unknown"),
-                "loggedInStatus": "PENDING_LOGIN" if is_customer_contact else "UNKNOWN",
+                "loggedInStatus": "UNKNOWN",
                 "agent": False if is_customer_contact else True,
             }
             if email and not is_customer_contact:
@@ -1073,16 +1073,13 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
             if is_portal_customer_id(account_id) or str(
                 customer.get("accountType") or customer.get("account_type") or ""
             ).casefold() == "customer":
-                if not status:
-                    status = "pending_login"
-                    row["status"] = "PENDING_LOGIN"
                 if status == "pending_login":
                     pending_portal_candidates.append((row, desk_id, account_id))
                 elif status == "logged_in":
                     row["reason"] = "customer has logged in / active"
                     rows.append(row)
                 else:
-                    row["reason"] = "contact is not in PENDING_LOGIN status"
+                    row["reason"] = "customer contact status is unavailable or not pending login"
                     rows.append(row)
                 continue
 

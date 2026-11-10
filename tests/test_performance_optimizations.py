@@ -108,7 +108,7 @@ class PerformanceOptimizationTests(unittest.TestCase):
             with self.assertRaisesRegex(app.ApiError, "pagination repeated a page"):
                 app.list_customers(config, "12", project_id="34")
 
-    def test_portal_customer_without_contact_record_is_treated_as_pending_login(self) -> None:
+    def test_portal_customer_without_contact_record_is_not_assumed_pending_login(self) -> None:
         def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
             parsed_url = urllib.parse.urlsplit(url)
             if "/rest/servicedesk/1/project/34/contacts" in parsed_url.path:
@@ -135,10 +135,10 @@ class PerformanceOptimizationTests(unittest.TestCase):
             contacts = app.list_customers(config, "12", project_id="34")
 
         self.assertEqual(len(contacts), 1)
-        self.assertEqual(contacts[0]["loggedInStatus"], "PENDING_LOGIN")
+        self.assertEqual(contacts[0]["loggedInStatus"], "UNKNOWN")
         self.assertFalse(contacts[0]["agent"])
 
-    def test_customer_type_without_contact_record_is_treated_as_pending_login(self) -> None:
+    def test_customer_type_without_contact_record_is_not_assumed_pending_login(self) -> None:
         def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
             parsed_url = urllib.parse.urlsplit(url)
             if "/rest/servicedesk/1/project/34/contacts" in parsed_url.path:
@@ -166,7 +166,7 @@ class PerformanceOptimizationTests(unittest.TestCase):
             contacts = app.list_customers(config, "12", project_id="34")
 
         self.assertEqual(len(contacts), 1)
-        self.assertEqual(contacts[0]["loggedInStatus"], "PENDING_LOGIN")
+        self.assertEqual(contacts[0]["loggedInStatus"], "UNKNOWN")
         self.assertFalse(contacts[0]["agent"])
 
     def test_unresolvable_atlassian_customer_is_skipped_without_crashing(self) -> None:
