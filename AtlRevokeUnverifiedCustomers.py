@@ -17,6 +17,7 @@ import http.client
 import json
 import math
 import os
+import random
 import sys
 import threading
 import time
@@ -30,7 +31,7 @@ ORG_API_BASE = "https://api.atlassian.com/admin/v1"
 PAGE_SIZE = 100
 REMOVE_BATCH_SIZE = 50
 CONTACT_PAGE_SIZE = 50
-CONTACT_PAGE_WORKERS = 4
+CONTACT_PAGE_WORKERS = 8
 REQUEST_TIMEOUT = 30
 MAX_READ_RETRIES = 3
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
@@ -88,7 +89,9 @@ def _retry_delay(attempt: int, headers: Any = None) -> float:
                     return min(max(seconds, 0), 30)
             except ValueError:
                 pass
-    return min(0.5 * (2**attempt), 5)
+    base_delay = min(0.5 * (2**attempt), 5)
+    jitter = random.uniform(0.25, 0.75)
+    return base_delay + jitter
 
 
 def _get_connection(
@@ -582,7 +585,14 @@ def _parse_contact_page(
 
 
 def list_customers(
-    config: dict[str, str], service_desk_id: str, project_id: str | None = None
+    config: dict[str, str],
+    service_desk_id: str,
+    project_id: str | None = None,
+    *,
+    input_ids: set[str] | None = None,
+    exclude_ids: set[str] | None = None,
+    contact_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
+    workers: int = CONTACT_PAGE_WORKERS,
 ) -> list[dict[str, Any]]:
     resolved_project_id = project_id or resolve_service_desk_project_id(
         config, service_desk_id
@@ -631,6 +641,18 @@ def list_customers(
                 continue
             if account_id:
                 seen_ids.add(account_id)
+            match_keys = {
+                key.casefold()
+                for key in (
+                    account_id,
+                    str(customer.get("email") or customer.get("emailAddress") or ""),
+                )
+                if key
+            }
+            if exclude_ids and match_keys & exclude_ids:
+                continue
+            if input_ids and not (match_keys & input_ids):
+                continue
             customers.append(customer)
             new_items += 1
 
@@ -664,34 +686,36 @@ def list_customers(
         sys.stderr.write("\n")
         sys.stderr.flush()
 
+    contact_cache = contact_cache if contact_cache is not None else {}
+
     def fetch_contact_details(customer: dict[str, Any]) -> dict[str, Any]:
         account_id = str(
             customer.get("accountId") or customer.get("identifier") or ""
         )
         if not account_id:
             return customer
+        key = (str(resolved_project_id), account_id)
+        if contact_cache is not None and key in contact_cache:
+            cached = contact_cache[key]
+            return {**customer, **cached}
+        if is_portal_customer_id(account_id):
+            contact = {
+                "accountId": account_id,
+                "identifier": account_id,
+                "accountType": "customer",
+                "agent": False,
+                "loggedInStatus": "PENDING_LOGIN",
+            }
+            contact_cache[key] = contact
+            return {**customer, **contact}
+
         contact_query = urllib.parse.urlencode({"query": account_id})
         contact_url = (
             f"{config['site']}/rest/servicedesk/1/project/"
             f"{urllib.parse.quote(str(resolved_project_id), safe='')}/contacts?"
             f"{contact_query}"
         )
-        try:
-            contact_response = request_json(
-                contact_url, api="jira", headers=headers
-            )
-        except ApiError:
-            if is_portal_customer_id(account_id):
-                return {
-                    **customer,
-                    "accountId": account_id,
-                    "identifier": account_id,
-                    "accountType": "customer",
-                    "agent": False,
-                    "loggedInStatus": "PENDING_LOGIN",
-                }
-            raise
-
+        contact_response = request_json(contact_url, api="jira", headers=headers)
         contact_values, _ = _parse_contact_page(contact_response)
         contact = next(
             (
@@ -704,26 +728,17 @@ def list_customers(
             None,
         )
         if contact is None:
-            if is_portal_customer_id(account_id):
-                return {
-                    **customer,
-                    "accountId": account_id,
-                    "identifier": account_id,
-                    "accountType": "customer",
-                    "agent": False,
-                    "loggedInStatus": "PENDING_LOGIN",
-                }
             raise ApiError(
                 "jira",
                 f"could not resolve service-desk contact details for account {account_id}",
             )
+        contact_cache[key] = contact
         return {**customer, **contact}
 
     contacts: list[dict[str, Any]] = []
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=CONTACT_PAGE_WORKERS
-    ) as executor:
-        chunk_size = CONTACT_PAGE_WORKERS * 4
+    worker_count = max(1, int(workers or CONTACT_PAGE_WORKERS))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+        chunk_size = max(1, worker_count * 4)
         for offset in range(0, len(customers), chunk_size):
             batch = customers[offset : offset + chunk_size]
             for contact in executor.map(fetch_contact_details, batch):
@@ -761,9 +776,7 @@ def is_portal_customer_id(account_id: str) -> bool:
 
 
 def has_issues(config: dict[str, str], account_id: str) -> bool:
-    query = (
-        f'reporter = "{account_id}" OR creator = "{account_id}"'
-    )
+    query = f'reporter = "{account_id}" OR creator = "{account_id}"'
     encoded_query = urllib.parse.quote(query)
     response = request_json(
         f"{config['site']}/rest/api/3/search?maxResults=1&jql={encoded_query}",
@@ -777,6 +790,27 @@ def has_issues(config: dict[str, str], account_id: str) -> bool:
         return total > 0
     issues = response.get("issues")
     return isinstance(issues, list) and bool(issues)
+
+
+def has_issues_for_accounts(
+    config: dict[str, str], account_ids: list[str], workers: int = CONTACT_PAGE_WORKERS
+) -> dict[str, bool]:
+    if not account_ids:
+        return {}
+    results: dict[str, bool] = {}
+    worker_count = max(1, min(len(account_ids), workers or CONTACT_PAGE_WORKERS))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(has_issues, config, account_id): account_id
+            for account_id in account_ids
+        }
+        for future in concurrent.futures.as_completed(futures):
+            account_id = futures[future]
+            try:
+                results[account_id] = future.result()
+            except ApiError:
+                results[account_id] = True
+    return results
 
 
 def is_portal_only(
@@ -922,8 +956,10 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
     rows: list[dict[str, str]] = []
     requested_matches: set[str] = set()
     candidates: list[tuple[dict[str, str], str, str]] = []
+    pending_portal_candidates: list[tuple[dict[str, str], str, str]] = []
     error_count = 0
     org_users = load_org_users(config)
+    contact_cache: dict[tuple[str, str], dict[str, Any]] = {}
 
     for desk in desks:
         desk_id = str(desk.get("id", ""))
@@ -938,6 +974,10 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                 if desk.get("projectId") not in (None, "")
                 else None
             ),
+            input_ids=input_ids,
+            exclude_ids=excluded_ids,
+            contact_cache=contact_cache,
+            workers=args.workers,
         )
         for customer in customers:
             account_id = str(customer.get("identifier") or customer.get("accountId") or "")
@@ -945,6 +985,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
             name = str(customer.get("displayName") or "")
             agent = customer.get("agent")
             match_keys = {key.casefold() for key in (account_id, email) if key}
+            requested_matches.update(match_keys & input_ids)
             status = customer_status(customer)
             account_type = (
                 "customer"
@@ -972,14 +1013,11 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                 error_count += 1
                 rows.append(row)
                 continue
-            matched_inputs = match_keys & input_ids
-            requested_matches.update(matched_inputs)
-
             if match_keys & excluded_ids:
                 row["reason"] = "present in exclude list"
                 rows.append(row)
                 continue
-            if input_mode and not matched_inputs:
+            if input_mode and not (match_keys & input_ids):
                 row["reason"] = "not present in input list"
                 rows.append(row)
                 continue
@@ -991,11 +1029,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                     status = "pending_login"
                     row["status"] = "PENDING_LOGIN"
                 if status == "pending_login":
-                    if has_issues(config, account_id):
-                        row["reason"] = "customer has reported or created issues"
-                        rows.append(row)
-                    else:
-                        candidates.append((row, desk_id, account_id))
+                    pending_portal_candidates.append((row, desk_id, account_id))
                 elif status == "logged_in":
                     row["reason"] = "customer has logged in / active"
                     rows.append(row)
@@ -1032,6 +1066,18 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
             else:
                 row["reason"] = "contact is not in PENDING_LOGIN status"
                 rows.append(row)
+
+    portal_issue_results = has_issues_for_accounts(
+        config,
+        [account_id for _, _, account_id in pending_portal_candidates],
+        workers=args.workers,
+    )
+    for row, desk_id, account_id in pending_portal_candidates:
+        if portal_issue_results.get(account_id, False):
+            row["reason"] = "customer has reported or created issues"
+            rows.append(row)
+        else:
+            candidates.append((row, desk_id, account_id))
 
     if input_ids:
         missing_inputs = input_ids - requested_matches
@@ -1166,6 +1212,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--out",
         metavar="PATH",
         help="CSV report path (default: unique timestamped filename)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=CONTACT_PAGE_WORKERS,
+        help="Concurrent worker count for contact and issue checks (default: 8)",
     )
     return parser.parse_args(argv)
 
