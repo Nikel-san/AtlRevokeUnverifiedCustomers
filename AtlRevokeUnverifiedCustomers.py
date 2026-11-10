@@ -676,9 +676,22 @@ def list_customers(
             f"{urllib.parse.quote(str(resolved_project_id), safe='')}/contacts?"
             f"{contact_query}"
         )
-        contact_response = request_json(
-            contact_url, api="jira", headers=headers
-        )
+        try:
+            contact_response = request_json(
+                contact_url, api="jira", headers=headers
+            )
+        except ApiError:
+            if is_portal_customer_id(account_id):
+                return {
+                    **customer,
+                    "accountId": account_id,
+                    "identifier": account_id,
+                    "accountType": "customer",
+                    "agent": False,
+                    "loggedInStatus": "PENDING_LOGIN",
+                }
+            raise
+
         contact_values, _ = _parse_contact_page(contact_response)
         contact = next(
             (
@@ -691,6 +704,15 @@ def list_customers(
             None,
         )
         if contact is None:
+            if is_portal_customer_id(account_id):
+                return {
+                    **customer,
+                    "accountId": account_id,
+                    "identifier": account_id,
+                    "accountType": "customer",
+                    "agent": False,
+                    "loggedInStatus": "PENDING_LOGIN",
+                }
             raise ApiError(
                 "jira",
                 f"could not resolve service-desk contact details for account {account_id}",
@@ -732,6 +754,29 @@ def jira_user_profile(
         api="jira",
         headers=jira_headers(config["jira_email"], config["jira_pat"]),
     )
+
+
+def is_portal_customer_id(account_id: str) -> bool:
+    return bool(account_id) and account_id.casefold().startswith("qm:")
+
+
+def has_issues(config: dict[str, str], account_id: str) -> bool:
+    query = (
+        f'reporter = "{account_id}" OR creator = "{account_id}"'
+    )
+    encoded_query = urllib.parse.quote(query)
+    response = request_json(
+        f"{config['site']}/rest/api/3/search?maxResults=1&jql={encoded_query}",
+        api="jira",
+        headers=jira_headers(config["jira_email"], config["jira_pat"]),
+    )
+    if not isinstance(response, dict):
+        return False
+    total = response.get("total")
+    if isinstance(total, int):
+        return total > 0
+    issues = response.get("issues")
+    return isinstance(issues, list) and bool(issues)
 
 
 def is_portal_only(
@@ -878,6 +923,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
     requested_matches: set[str] = set()
     candidates: list[tuple[dict[str, str], str, str]] = []
     error_count = 0
+    org_users = load_org_users(config)
 
     for desk in desks:
         desk_id = str(desk.get("id", ""))
@@ -900,17 +946,21 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
             agent = customer.get("agent")
             match_keys = {key.casefold() for key in (account_id, email) if key}
             status = customer_status(customer)
+            account_type = (
+                "customer"
+                if is_portal_customer_id(account_id)
+                or str(customer.get("accountType") or customer.get("account_type") or "").casefold() == "customer"
+                else "agent"
+                if agent is True
+                else "atlassian"
+                if customer.get("accountType") == "atlassian"
+                else "unknown"
+            )
             row = {
                 "email": email,
                 "display_name": name,
                 "account_id": account_id,
-                "account_type": (
-                    "customer"
-                    if agent is False
-                    else "agent"
-                    if agent is True
-                    else "unknown"
-                ),
+                "account_type": account_type,
                 "service_desk": desk_name,
                 "status": customer_status_label(status),
                 "action": "skipped",
@@ -934,6 +984,26 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                 rows.append(row)
                 continue
 
+            if is_portal_customer_id(account_id) or str(
+                customer.get("accountType") or customer.get("account_type") or ""
+            ).casefold() == "customer":
+                if not status:
+                    status = "pending_login"
+                    row["status"] = "PENDING_LOGIN"
+                if status == "pending_login":
+                    if has_issues(config, account_id):
+                        row["reason"] = "customer has reported or created issues"
+                        rows.append(row)
+                    else:
+                        candidates.append((row, desk_id, account_id))
+                elif status == "logged_in":
+                    row["reason"] = "customer has logged in / active"
+                    rows.append(row)
+                else:
+                    row["reason"] = "contact is not in PENDING_LOGIN status"
+                    rows.append(row)
+                continue
+
             if agent is not False:
                 row["reason"] = (
                     "contact is an agent and not a customer"
@@ -943,6 +1013,17 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                 rows.append(row)
                 continue
 
+            profile = jira_user_profile(config, account_id)
+            org_user = org_users.get(account_id.casefold())
+            is_portal, portal_reason = is_portal_only(
+                str(profile.get("accountType") or profile.get("account_type") or "").casefold(),
+                org_user,
+                profile,
+            )
+            if not is_portal:
+                row["reason"] = portal_reason or "account is not eligible for removal"
+                rows.append(row)
+                continue
             if status == "pending_login":
                 candidates.append((row, desk_id, account_id))
             elif status == "logged_in":
