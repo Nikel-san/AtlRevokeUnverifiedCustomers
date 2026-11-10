@@ -589,90 +589,133 @@ def list_customers(
     )
     headers = jira_headers(config["jira_email"], config["jira_pat"])
     headers["X-ExperimentalApi"] = "opt-in"
-
-    contacts: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
     is_tty = sys.stderr.isatty()
-
-    def fetch_page(start: int) -> dict[str, Any] | list[Any]:
-        query = urllib.parse.urlencode({"start": start, "limit": CONTACT_PAGE_SIZE})
-        url = (
-            f"{config['site']}/rest/servicedesk/1/project/"
-            f"{urllib.parse.quote(str(resolved_project_id), safe='')}/contacts?{query}"
+    customers: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    start = 0
+    while True:
+        page_query = urllib.parse.urlencode(
+            {"start": start, "limit": CONTACT_PAGE_SIZE}
         )
-        return request_json(url, api="jira", headers=headers)
+        page_url = (
+            f"{config['site']}/rest/servicedeskapi/servicedesk/"
+            f"{urllib.parse.quote(service_desk_id, safe='')}/customer?{page_query}"
+        )
+        response = request_json(page_url, api="jira", headers=headers)
+        if not isinstance(response, dict) or not isinstance(
+            response.get("values"), list
+        ):
+            keys = (
+                sorted(response)
+                if isinstance(response, dict)
+                else type(response).__name__
+            )
+            raise ApiError(
+                "jira",
+                "service-desk customer response did not contain a values list; "
+                f"received {keys}",
+            )
 
-    def add_contacts(page_values: list[Any]) -> int:
-        if not page_values:
-            return 0
+        page_values = response["values"]
+        if not all(isinstance(item, dict) for item in page_values):
+            raise ApiError(
+                "jira", "service-desk customer response contained an invalid item"
+            )
+
         new_items = 0
-        for item in page_values:
-            if not isinstance(item, dict):
+        for customer in page_values:
+            account_id = str(
+                customer.get("accountId") or customer.get("identifier") or ""
+            )
+            if account_id and account_id in seen_ids:
                 continue
-            identifier = str(item.get("identifier") or item.get("accountId") or "")
-            if identifier and identifier in seen_ids:
-                continue
-            if identifier:
-                seen_ids.add(identifier)
-            contacts.append(item)
+            if account_id:
+                seen_ids.add(account_id)
+            customers.append(customer)
             new_items += 1
-        return new_items
 
-    def report_progress(total: Any) -> None:
-        total_str = f"/{total}" if isinstance(total, int) and total > 0 else ""
         if is_tty:
-            sys.stderr.write(f"\rScanning contacts: {len(contacts)}{total_str} fetched...")
+            sys.stderr.write(f"\rScanning customers: {len(customers)} fetched...")
             sys.stderr.flush()
-        elif len(contacts) % 500 == 0:
-            sys.stderr.write(f"Scanning contacts: {len(contacts)}{total_str} fetched...\n")
+        elif len(customers) and len(customers) % 500 == 0:
+            sys.stderr.write(f"Scanning customers: {len(customers)} fetched.\n")
 
-    first_values, first_metadata = _parse_contact_page(fetch_page(0))
-    add_contacts(first_values)
-    total = first_metadata.get("total")
-    report_progress(total)
-
-    if len(first_values) >= CONTACT_PAGE_SIZE:
-        start = CONTACT_PAGE_SIZE
-        page_response = fetch_page(start)
-        page, page_metadata = _parse_contact_page(page_response)
-        page_values = page
-        new_items = add_contacts(page_values)
-        response_keys = (
-            sorted(page_response) if isinstance(page_response, dict) else None
-        )
-        print(
-            "DEBUG: contacts page "
-            f"start={start} len(page_values)={len(page_values)} "
-            f"new_items={new_items} metadata={page_metadata!r} "
-            f"response_type={type(page_response).__name__} "
-            f"response_keys={response_keys!r}",
-            file=sys.stderr,
-        )
-        report_progress(total)
+        is_last_page = response.get("isLastPage")
+        if is_last_page is True:
+            break
+        if not page_values:
+            if is_last_page is False:
+                raise ApiError(
+                    "jira",
+                    f"service-desk customer page at start={start} was empty "
+                    "but marked as not last",
+                )
+            break
+        if is_last_page is not False and len(page_values) < CONTACT_PAGE_SIZE:
+            break
+        if new_items == 0:
+            raise ApiError(
+                "jira",
+                f"service-desk customer pagination repeated a page at start={start}",
+            )
         start += len(page_values)
 
-        if len(page_values) >= CONTACT_PAGE_SIZE and new_items:
-            if isinstance(total, int) and total > start:
-                offsets = range(start, total, CONTACT_PAGE_SIZE)
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=CONTACT_PAGE_WORKERS
-                ) as executor:
-                    for page_start, page in zip(
-                        offsets, executor.map(fetch_page, offsets)
-                    ):
-                        page_values, _ = _parse_contact_page(page)
-                        new_items = add_contacts(page_values)
-                        report_progress(total)
-                        start = page_start + len(page_values)
-
-            while len(page_values) >= CONTACT_PAGE_SIZE and new_items:
-                page, _ = _parse_contact_page(fetch_page(start))
-                page_values = page
-                new_items = add_contacts(page_values)
-                report_progress(total)
-                start += len(page_values)
-
     if is_tty:
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+
+    def fetch_contact_details(customer: dict[str, Any]) -> dict[str, Any]:
+        account_id = str(
+            customer.get("accountId") or customer.get("identifier") or ""
+        )
+        if not account_id:
+            return customer
+        contact_query = urllib.parse.urlencode({"query": account_id})
+        contact_url = (
+            f"{config['site']}/rest/servicedesk/1/project/"
+            f"{urllib.parse.quote(str(resolved_project_id), safe='')}/contacts?"
+            f"{contact_query}"
+        )
+        contact_response = request_json(
+            contact_url, api="jira", headers=headers
+        )
+        contact_values, _ = _parse_contact_page(contact_response)
+        contact = next(
+            (
+                item
+                for item in contact_values
+                if isinstance(item, dict)
+                and str(item.get("identifier") or item.get("accountId") or "")
+                == account_id
+            ),
+            None,
+        )
+        if contact is None:
+            raise ApiError(
+                "jira",
+                f"could not resolve service-desk contact details for account {account_id}",
+            )
+        return {**customer, **contact}
+
+    contacts: list[dict[str, Any]] = []
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=CONTACT_PAGE_WORKERS
+    ) as executor:
+        chunk_size = CONTACT_PAGE_WORKERS * 4
+        for offset in range(0, len(customers), chunk_size):
+            batch = customers[offset : offset + chunk_size]
+            for contact in executor.map(fetch_contact_details, batch):
+                contacts.append(contact)
+                if is_tty:
+                    sys.stderr.write(
+                        f"\rResolving contact details: {len(contacts)}/{len(customers)}..."
+                    )
+                    sys.stderr.flush()
+                elif len(contacts) % 500 == 0:
+                    sys.stderr.write(
+                        f"Resolved contact details: {len(contacts)}/{len(customers)}.\n"
+                    )
+    if is_tty and customers:
         sys.stderr.write("\n")
         sys.stderr.flush()
     return contacts

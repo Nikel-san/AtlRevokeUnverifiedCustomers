@@ -114,15 +114,19 @@ The CSV report contains these columns:
 In live mode the script removes customer access from the selected service
 desk(s) only. It never deletes or deactivates Atlassian accounts.
 
-Contacts are discovered through
-`GET /rest/servicedesk/1/project/{projectId}/contacts`. The script requires
-`loggedInStatus: "PENDING_LOGIN"` and `agent: false` before considering a
-contact for removal. `--input-file` narrows the contacts processed but cannot
-override those safety checks. `LOGGED_IN`, missing/unknown statuses, agents,
-and contacts whose agent status is not explicitly `false` are skipped.
+Customers are enumerated with the paginated
+`GET /rest/servicedeskapi/servicedesk/{serviceDeskId}/customer` endpoint.
+For each account, the script looks up its contact details using the
+`query` parameter on
+`GET /rest/servicedesk/1/project/{projectId}/contacts` to obtain
+`loggedInStatus` and `agent`. The latter endpoint is not used for offset
+pagination. The script requires `loggedInStatus: "PENDING_LOGIN"` and
+`agent: false` before considering a contact for removal. `--input-file`
+narrows the contacts processed but cannot override those safety checks.
+`LOGGED_IN`, missing/unknown statuses, agents, and contacts whose agent status
+is not explicitly `false` are skipped.
 
 Transient read-only GET failures (HTTP 429 and common 5xx responses) are
-retried with bounded backoff. HTTPS connections are reused, and after the
-contact total is read, remaining 50-contact pages are fetched with up to four
-concurrent requests. Removal requests are never automatically retried and are
-sent in batches of 50.
+retried with bounded backoff. HTTPS connections are reused, and the per-account
+contact lookups run with up to four concurrent requests. Removal requests are
+never automatically retried and are sent in batches of 50.

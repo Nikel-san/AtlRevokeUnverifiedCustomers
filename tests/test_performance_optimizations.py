@@ -1,7 +1,6 @@
-import contextlib
-import io
 import threading
 import unittest
+import urllib.parse
 from unittest import mock
 
 import AtlRevokeUnverifiedCustomers as app
@@ -31,100 +30,47 @@ class PerformanceOptimizationTests(unittest.TestCase):
         create.assert_called_once_with("example.test", port=None, timeout=30)
         self.assertEqual(connection.request.call_count, 2)
 
-    def test_contact_pages_are_fetched_concurrently_and_deduplicated(self) -> None:
-        barrier = threading.Barrier(2)
-        requested_offsets: list[int] = []
+    def test_public_customer_pages_are_enriched_with_contact_details(self) -> None:
+        page_starts: list[int] = []
+        contact_queries: list[str] = []
         lock = threading.Lock()
 
         def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
-            offset = int(url.split("start=")[1].split("&")[0])
+            parsed_url = urllib.parse.urlsplit(url)
+            params = urllib.parse.parse_qs(parsed_url.query)
+            if "/rest/servicedeskapi/servicedesk/12/customer" in parsed_url.path:
+                start = int(params["start"][0])
+                with lock:
+                    page_starts.append(start)
+                end = min(start + 50, 103)
+                return {
+                    "start": start,
+                    "limit": 50,
+                    "isLastPage": end == 103,
+                    "values": [
+                        {
+                            "accountId": f"user-{index}",
+                            "emailAddress": f"user-{index}@example.test",
+                        }
+                        for index in range(start, end)
+                    ],
+                }
+
+            self.assertIn(
+                "/rest/servicedesk/1/project/34/contacts", parsed_url.path
+            )
+            account_id = params["query"][0]
+            self.assertNotIn("start", params)
+            self.assertNotIn("limit", params)
             with lock:
-                requested_offsets.append(offset)
-            if offset in {100, 150}:
-                barrier.wait(timeout=2)
-            start = offset
-            end = {
-                0: 50,
-                50: 100,
-                100: 150,
-                150: 200,
-                200: 220,
-            }.get(offset, offset)
-            contacts = [{"identifier": f"user-{index}"} for index in range(start, end)]
-            if offset == 100:
-                contacts.insert(0, {"identifier": "user-99"})
-            result = {"contactResults": contacts}
-            if offset == 0:
-                result["contactPageMetadata"] = {"total": 220}
-            return result
-
-        config = {
-            "site": "https://example.test",
-            "jira_email": "user@example.test",
-            "jira_pat": "not-used",
-        }
-        with mock.patch.object(app, "request_json", side_effect=fake_request):
-            contacts = app.list_customers(config, "12", project_id="34")
-
-        self.assertCountEqual(requested_offsets, [0, 50, 100, 150, 200])
-        self.assertEqual(len(contacts), 220)
-        self.assertEqual(len({contact["identifier"] for contact in contacts}), 220)
-
-    def test_contact_pages_continue_when_first_page_metadata_claims_last_page(self) -> None:
-        requested_offsets: list[int] = []
-        stderr = io.StringIO()
-
-        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
-            offset = int(url.split("start=")[1].split("&")[0])
-            requested_offsets.append(offset)
-            end = {0: 50, 50: 100, 100: 103}.get(offset, offset)
-            result = {
-                "contactResults": [
-                    {"identifier": f"user-{index}"}
-                    for index in range(offset, end)
-                ]
-            }
-            if offset == 0:
-                result["contactPageMetadata"] = {
-                    "total": 50,
-                    "isLastPage": True,
-                }
-            elif offset == 50:
-                result["contactPageMetadata"] = {
-                    "total": 2,
-                    "isLastPage": False,
-                }
-            return result
-
-        config = {
-            "site": "https://example.test",
-            "jira_email": "user@example.test",
-            "jira_pat": "not-used",
-        }
-        with (
-            mock.patch.object(app, "request_json", side_effect=fake_request),
-            contextlib.redirect_stderr(stderr),
-        ):
-            contacts = app.list_customers(config, "12", project_id="34")
-
-        self.assertEqual(requested_offsets, [0, 50, 100])
-        self.assertEqual(len(contacts), 103)
-        self.assertIn("start=50 len(page_values)=50 new_items=50", stderr.getvalue())
-        self.assertIn(
-            "metadata={'total': 2, 'isLastPage': False}", stderr.getvalue()
-        )
-
-    def test_contact_pages_without_total_keep_sequential_fallback(self) -> None:
-        requested_offsets: list[int] = []
-
-        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
-            offset = int(url.split("start=")[1].split("&")[0])
-            requested_offsets.append(offset)
-            end = 50 if offset == 0 else 60
+                contact_queries.append(account_id)
             return {
                 "contactResults": [
-                    {"identifier": f"user-{index}"}
-                    for index in range(offset, end)
+                    {
+                        "identifier": account_id,
+                        "loggedInStatus": "PENDING_LOGIN",
+                        "agent": False,
+                    }
                 ]
             }
 
@@ -136,8 +82,31 @@ class PerformanceOptimizationTests(unittest.TestCase):
         with mock.patch.object(app, "request_json", side_effect=fake_request):
             contacts = app.list_customers(config, "12", project_id="34")
 
-        self.assertEqual(requested_offsets, [0, 50])
-        self.assertEqual(len(contacts), 60)
+        self.assertEqual(page_starts, [0, 50, 100])
+        self.assertCountEqual(contact_queries, [f"user-{index}" for index in range(103)])
+        self.assertEqual(len(contacts), 103)
+        self.assertTrue(all(contact["agent"] is False for contact in contacts))
+        self.assertTrue(
+            all(contact["loggedInStatus"] == "PENDING_LOGIN" for contact in contacts)
+        )
+
+    def test_repeated_public_customer_page_fails_instead_of_truncating_scan(self) -> None:
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            return {
+                "start": 0,
+                "limit": 50,
+                "isLastPage": False,
+                "values": [{"accountId": f"user-{index}"} for index in range(50)],
+            }
+
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            with self.assertRaisesRegex(app.ApiError, "pagination repeated a page"):
+                app.list_customers(config, "12", project_id="34")
 
 
 if __name__ == "__main__":
