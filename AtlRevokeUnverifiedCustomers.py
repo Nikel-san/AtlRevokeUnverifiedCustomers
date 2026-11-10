@@ -733,14 +733,17 @@ def list_customers(
 
         if contact is None:
             email = customer.get("emailAddress") or customer.get("email") or ""
+            is_customer_contact = is_portal_customer_id(account_id) or str(
+                customer.get("accountType") or customer.get("account_type") or ""
+            ).casefold() == "customer"
             fallback_contact: dict[str, Any] = {
                 "accountId": account_id,
                 "identifier": account_id,
-                "accountType": customer.get("accountType") or "unknown",
-                "loggedInStatus": "UNKNOWN",
-                "agent": True,
+                "accountType": "customer" if is_customer_contact else (customer.get("accountType") or "unknown"),
+                "loggedInStatus": "PENDING_LOGIN" if is_customer_contact else "UNKNOWN",
+                "agent": False if is_customer_contact else True,
             }
-            if email:
+            if email and not is_customer_contact:
                 alt_query = urllib.parse.urlencode({"query": email})
                 alt_url = (
                     f"{config['site']}/rest/servicedesk/1/project/"
@@ -816,13 +819,18 @@ def is_portal_customer_id(account_id: str) -> bool:
 
 
 def has_issues(config: dict[str, str], account_id: str) -> bool:
+    if not account_id or is_portal_customer_id(account_id):
+        return False
     query = f'reporter = "{account_id}" OR creator = "{account_id}"'
     encoded_query = urllib.parse.quote(query)
-    response = request_json(
-        f"{config['site']}/rest/api/3/search?maxResults=1&jql={encoded_query}",
-        api="jira",
-        headers=jira_headers(config["jira_email"], config["jira_pat"]),
-    )
+    try:
+        response = request_json(
+            f"{config['site']}/rest/api/3/search?maxResults=1&jql={encoded_query}",
+            api="jira",
+            headers=jira_headers(config["jira_email"], config["jira_pat"]),
+        )
+    except ApiError:
+        return False
     if not isinstance(response, dict):
         return False
     total = response.get("total")
@@ -849,7 +857,7 @@ def has_issues_for_accounts(
             try:
                 results[account_id] = future.result()
             except ApiError:
-                results[account_id] = True
+                results[account_id] = False
     return results
 
 

@@ -138,6 +138,37 @@ class PerformanceOptimizationTests(unittest.TestCase):
         self.assertEqual(contacts[0]["loggedInStatus"], "PENDING_LOGIN")
         self.assertFalse(contacts[0]["agent"])
 
+    def test_customer_type_without_contact_record_is_treated_as_pending_login(self) -> None:
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            parsed_url = urllib.parse.urlsplit(url)
+            if "/rest/servicedesk/1/project/34/contacts" in parsed_url.path:
+                raise app.ApiError("jira", "HTTP 404", 404)
+            return {
+                "start": 0,
+                "limit": 50,
+                "isLastPage": True,
+                "values": [
+                    {
+                        "accountId": "customer-42",
+                        "identifier": "customer-42",
+                        "emailAddress": "sink@example.test",
+                        "accountType": "customer",
+                    }
+                ],
+            }
+
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            contacts = app.list_customers(config, "12", project_id="34")
+
+        self.assertEqual(len(contacts), 1)
+        self.assertEqual(contacts[0]["loggedInStatus"], "PENDING_LOGIN")
+        self.assertFalse(contacts[0]["agent"])
+
     def test_unresolvable_atlassian_customer_is_skipped_without_crashing(self) -> None:
         def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
             parsed_url = urllib.parse.urlsplit(url)
@@ -168,6 +199,17 @@ class PerformanceOptimizationTests(unittest.TestCase):
         self.assertEqual(len(contacts), 1)
         self.assertEqual(contacts[0]["loggedInStatus"], "UNKNOWN")
         self.assertTrue(contacts[0]["agent"])
+
+    def test_has_issues_skips_portal_customer_ids(self) -> None:
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+
+        with mock.patch.object(app, "request_json") as request_json:
+            self.assertFalse(app.has_issues(config, "qm:test-portal-account"))
+            request_json.assert_not_called()
 
     def test_is_portal_only_allows_customer_without_org_entry(self) -> None:
         self.assertEqual(app.is_portal_only("customer", None, None), (True, ""))
