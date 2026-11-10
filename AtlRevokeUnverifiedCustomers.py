@@ -715,23 +715,63 @@ def list_customers(
             f"{urllib.parse.quote(str(resolved_project_id), safe='')}/contacts?"
             f"{contact_query}"
         )
-        contact_response = request_json(contact_url, api="jira", headers=headers)
-        contact_values, _ = _parse_contact_page(contact_response)
-        contact = next(
-            (
-                item
-                for item in contact_values
-                if isinstance(item, dict)
-                and str(item.get("identifier") or item.get("accountId") or "")
-                == account_id
-            ),
-            None,
-        )
-        if contact is None:
-            raise ApiError(
-                "jira",
-                f"could not resolve service-desk contact details for account {account_id}",
+        try:
+            contact_response = request_json(contact_url, api="jira", headers=headers)
+            contact_values, _ = _parse_contact_page(contact_response)
+            contact = next(
+                (
+                    item
+                    for item in contact_values
+                    if isinstance(item, dict)
+                    and str(item.get("identifier") or item.get("accountId") or "")
+                    == account_id
+                ),
+                None,
             )
+        except ApiError:
+            contact = None
+
+        if contact is None:
+            email = customer.get("emailAddress") or customer.get("email") or ""
+            fallback_contact: dict[str, Any] = {
+                "accountId": account_id,
+                "identifier": account_id,
+                "accountType": customer.get("accountType") or "unknown",
+                "loggedInStatus": "UNKNOWN",
+                "agent": True,
+            }
+            if email:
+                alt_query = urllib.parse.urlencode({"query": email})
+                alt_url = (
+                    f"{config['site']}/rest/servicedesk/1/project/"
+                    f"{urllib.parse.quote(str(resolved_project_id), safe='')}/contacts?"
+                    f"{alt_query}"
+                )
+                try:
+                    alt_response = request_json(alt_url, api="jira", headers=headers)
+                    alt_values, _ = _parse_contact_page(alt_response)
+                    alt_contact = next(
+                        (
+                            item
+                            for item in alt_values
+                            if isinstance(item, dict)
+                            and (
+                                str(item.get("identifier") or item.get("accountId") or "").casefold()
+                                == account_id.casefold()
+                                or str(item.get("email") or item.get("emailAddress") or "").casefold()
+                                == email.casefold()
+                            )
+                        ),
+                        None,
+                    )
+                    if alt_contact is not None:
+                        contact = alt_contact
+                        contact_cache[key] = contact
+                        return {**customer, **contact}
+                except ApiError:
+                    pass
+            contact_cache[key] = fallback_contact
+            return {**customer, **fallback_contact}
         contact_cache[key] = contact
         return {**customer, **contact}
 

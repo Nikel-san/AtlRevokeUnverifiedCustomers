@@ -138,6 +138,37 @@ class PerformanceOptimizationTests(unittest.TestCase):
         self.assertEqual(contacts[0]["loggedInStatus"], "PENDING_LOGIN")
         self.assertFalse(contacts[0]["agent"])
 
+    def test_unresolvable_atlassian_customer_is_skipped_without_crashing(self) -> None:
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            parsed_url = urllib.parse.urlsplit(url)
+            if "/rest/servicedesk/1/project/34/contacts" in parsed_url.path:
+                raise app.ApiError("jira", "HTTP 404", 404)
+            return {
+                "start": 0,
+                "limit": 50,
+                "isLastPage": True,
+                "values": [
+                    {
+                        "accountId": "atlassian-user-1",
+                        "identifier": "atlassian-user-1",
+                        "emailAddress": "user@example.test",
+                        "accountType": "atlassian",
+                    }
+                ],
+            }
+
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            contacts = app.list_customers(config, "12", project_id="34")
+
+        self.assertEqual(len(contacts), 1)
+        self.assertEqual(contacts[0]["loggedInStatus"], "UNKNOWN")
+        self.assertTrue(contacts[0]["agent"])
+
     def test_is_portal_only_allows_customer_without_org_entry(self) -> None:
         self.assertEqual(app.is_portal_only("customer", None, None), (True, ""))
 
