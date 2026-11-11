@@ -127,8 +127,15 @@ cause a clear error and exit code 2.
 
 Select one target with `-d` / `--service-desk-id`, `-p` / `--project-key`, or
 `--all-service-desks`. The script resolves each desk's project ID and
-discovers contacts through
-`GET /rest/servicedesk/1/project/{projectId}/contacts`, including pagination.
+discovers contacts through the paginated
+`GET /rest/servicedesk/1/project/{projectId}/contacts` endpoint. Bulk contacts
+are indexed by account ID, email, and unique normalized display name; unresolved
+customers fall back to account-ID and email searches. Portal IDs (`qm:`) are
+searched by email rather than by their internal ID. A single email-search
+result may be used when Jira redacts its email or reports a different
+identifier, while ambiguous display-name matches are rejected. If bulk
+discovery is unavailable, the script warns before using per-account searches.
+
 Removal eligibility requires both `loggedInStatus: "PENDING_LOGIN"` and
 `agent: false`. `LOGGED_IN`, unknown/missing statuses, agents, and contacts
 without an explicit `agent: false` are skipped. No ticket-history, account

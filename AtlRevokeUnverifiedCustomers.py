@@ -31,6 +31,7 @@ ORG_API_BASE = "https://api.atlassian.com/admin/v1"
 PAGE_SIZE = 100
 REMOVE_BATCH_SIZE = 50
 CONTACT_PAGE_SIZE = 50
+PROJECT_CONTACT_PAGE_SIZE = 100
 CONTACT_PAGE_WORKERS = 8
 REQUEST_TIMEOUT = 30
 MAX_READ_RETRIES = 3
@@ -552,11 +553,9 @@ def _parse_contact_page(
         page_values = page
         metadata: dict[str, Any] = {}
     else:
-        metadata = (
-            page.get("contactPageMetadata")
-            if isinstance(page.get("contactPageMetadata"), dict)
-            else {}
-        )
+        metadata = dict(page)
+        if isinstance(page.get("contactPageMetadata"), dict):
+            metadata.update(page["contactPageMetadata"])
         page_values = None
         for key in ("contactResults", "values", "data", "items", "results", "contacts"):
             candidate = page.get(key)
@@ -582,6 +581,177 @@ def _parse_contact_page(
             ),
         )
     return page_values, metadata
+
+
+def _normalized_contact_key(value: Any) -> str:
+    return value.strip().casefold() if isinstance(value, str) else ""
+
+
+def _contact_identity(contact: dict[str, Any]) -> tuple[str, ...]:
+    return (
+        _normalized_contact_key(contact.get("identifier")),
+        _normalized_contact_key(contact.get("accountId")),
+        _normalized_contact_key(contact.get("email")),
+        _normalized_contact_key(contact.get("emailAddress")),
+        _normalized_contact_key(contact.get("displayName")),
+    )
+
+
+def _index_project_contacts(
+    contacts: list[dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any] | None], ...]:
+    indexes: tuple[dict[str, dict[str, Any] | None], ...] = ({}, {}, {})
+    for contact in contacts:
+        keys_by_type = (
+            (
+                _normalized_contact_key(contact.get("identifier")),
+                _normalized_contact_key(contact.get("accountId")),
+            ),
+            (
+                _normalized_contact_key(contact.get("email")),
+                _normalized_contact_key(contact.get("emailAddress")),
+            ),
+            (_normalized_contact_key(contact.get("displayName")),),
+        )
+        for index, keys in zip(indexes, keys_by_type):
+            for key in keys:
+                if not key:
+                    continue
+                existing = index.get(key)
+                if key not in index:
+                    index[key] = contact
+                elif existing != contact:
+                    index[key] = None
+    return indexes
+
+
+def _find_contact(
+    values: list[Any],
+    account_id: str,
+    email: str,
+    display_name: str,
+    *,
+    accept_single_email_result: bool = False,
+    match_display_name: bool = False,
+) -> dict[str, Any] | None:
+    contacts = [item for item in values if isinstance(item, dict)]
+    if accept_single_email_result and len(contacts) == 1:
+        return contacts[0]
+
+    account_key = _normalized_contact_key(account_id)
+    email_key = _normalized_contact_key(email)
+    name_key = _normalized_contact_key(display_name)
+    matches = [
+        item
+        for item in contacts
+        if (
+            account_key
+            and account_key
+            in {
+                _normalized_contact_key(item.get("identifier")),
+                _normalized_contact_key(item.get("accountId")),
+            }
+        )
+        or (
+            email_key
+            and email_key
+            in {
+                _normalized_contact_key(item.get("email")),
+                _normalized_contact_key(item.get("emailAddress")),
+            }
+        )
+        or (
+            match_display_name
+            and name_key
+            and _normalized_contact_key(item.get("displayName")) == name_key
+        )
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _list_project_contacts(
+    config: dict[str, str],
+    project_id: str,
+    headers: dict[str, str],
+) -> list[dict[str, Any]]:
+    contacts: list[dict[str, Any]] = []
+    seen_contacts: set[tuple[str, ...]] = set()
+    seen_pages: set[tuple[tuple[str, ...], ...]] = set()
+    start = 0
+    while True:
+        page_query = urllib.parse.urlencode(
+            {"start": start, "limit": PROJECT_CONTACT_PAGE_SIZE}
+        )
+        page_url = (
+            f"{config['site']}/rest/servicedesk/1/project/"
+            f"{urllib.parse.quote(project_id, safe='')}/contacts?{page_query}"
+        )
+        response = request_json(page_url, api="jira", headers=headers)
+        page_values, metadata = _parse_contact_page(response)
+        if not all(isinstance(item, dict) for item in page_values):
+            raise ApiError("jira", "project contact response contained an invalid item")
+
+        page_contacts = [item for item in page_values if isinstance(item, dict)]
+        page_signature = tuple(
+            sorted(_contact_identity(item) for item in page_contacts)
+        )
+        if page_signature in seen_pages and page_contacts:
+            raise ApiError(
+                "jira",
+                f"project contact pagination repeated a page at start={start}",
+            )
+        seen_pages.add(page_signature)
+
+        new_contacts = 0
+        for contact in page_contacts:
+            identity = _contact_identity(contact)
+            if identity not in seen_contacts:
+                seen_contacts.add(identity)
+                contacts.append(contact)
+                new_contacts += 1
+
+        is_last_page = metadata.get("isLastPage")
+        if not isinstance(is_last_page, bool):
+            has_next_page = metadata.get("hasNextPage", metadata.get("hasMore"))
+            if isinstance(has_next_page, bool):
+                is_last_page = not has_next_page
+            else:
+                total = next(
+                    (
+                        metadata.get(name)
+                        for name in ("total", "totalCount", "totalSize")
+                        if isinstance(metadata.get(name), int)
+                        and not isinstance(metadata.get(name), bool)
+                    ),
+                    None,
+                )
+                page_start = metadata.get("start", metadata.get("offset", start))
+                if (
+                    total is not None
+                    and isinstance(page_start, int)
+                    and not isinstance(page_start, bool)
+                ):
+                    is_last_page = page_start + len(page_contacts) >= total
+        if is_last_page is True:
+            break
+        if not page_contacts:
+            if is_last_page is False:
+                raise ApiError(
+                    "jira",
+                    (
+                        f"project contact page at start={start} was empty "
+                        "but marked as not last"
+                    ),
+                )
+            break
+        if new_contacts == 0:
+            raise ApiError(
+                "jira",
+                f"project contact pagination repeated contacts at start={start}",
+            )
+        start += len(page_contacts)
+
+    return contacts
 
 
 def list_customers(
@@ -687,6 +857,26 @@ def list_customers(
         sys.stderr.flush()
 
     contact_cache = contact_cache if contact_cache is not None else {}
+    bulk_contact_error = False
+    try:
+        project_contacts = _list_project_contacts(
+            config, str(resolved_project_id), headers
+        )
+    except ApiError as error:
+        if error.status in {401, 403, 429, 500, 502, 503, 504}:
+            raise
+        warn(
+            f"Bulk contact discovery failed ({error}); "
+            "falling back to contact searches."
+        )
+        project_contacts = []
+        bulk_contact_error = True
+    if customers and not project_contacts and not bulk_contact_error:
+        warn(
+            "Bulk contact discovery returned no contacts; "
+            "falling back to contact searches."
+        )
+    contact_indexes = _index_project_contacts(project_contacts)
 
     def fetch_contact_details(customer: dict[str, Any]) -> dict[str, Any]:
         account_id = str(
@@ -699,70 +889,65 @@ def list_customers(
             cached = contact_cache[key]
             return {**customer, **cached}
 
-        contact_query = urllib.parse.urlencode({"query": account_id})
-        contact_url = (
-            f"{config['site']}/rest/servicedesk/1/project/"
-            f"{urllib.parse.quote(str(resolved_project_id), safe='')}/contacts?"
-            f"{contact_query}"
-        )
-        try:
-            contact_response = request_json(contact_url, api="jira", headers=headers)
-            contact_values, _ = _parse_contact_page(contact_response)
-            contact = next(
-                (
-                    item
-                    for item in contact_values
-                    if isinstance(item, dict)
-                    and str(item.get("identifier") or item.get("accountId") or "")
-                    == account_id
-                ),
-                None,
+        email = str(customer.get("emailAddress") or customer.get("email") or "")
+        display_name = str(customer.get("displayName") or "")
+        is_customer_contact = is_portal_customer_id(account_id) or str(
+            customer.get("accountType") or customer.get("account_type") or ""
+        ).casefold() == "customer"
+        account_key = _normalized_contact_key(account_id)
+        email_key = _normalized_contact_key(email)
+        name_key = _normalized_contact_key(display_name)
+        contact = None
+        for index, lookup_key in zip(
+            contact_indexes, (account_key, email_key, name_key)
+        ):
+            if lookup_key and lookup_key in index:
+                contact = index[lookup_key]
+                if contact is not None:
+                    break
+
+        def find_contact_by_query(
+            query: str, *, is_email_query: bool
+        ) -> dict[str, Any] | None:
+            contact_query = urllib.parse.urlencode({"query": query})
+            contact_url = (
+                f"{config['site']}/rest/servicedesk/1/project/"
+                f"{urllib.parse.quote(str(resolved_project_id), safe='')}/contacts?"
+                f"{contact_query}"
             )
-        except ApiError:
-            contact = None
+            try:
+                contact_response = request_json(
+                    contact_url, api="jira", headers=headers
+                )
+                contact_values, _ = _parse_contact_page(contact_response)
+            except ApiError as error:
+                if error.status in {401, 403, 429, 500, 502, 503, 504}:
+                    raise
+                return None
+            return _find_contact(
+                contact_values,
+                account_id,
+                email if is_email_query else "",
+                display_name,
+                accept_single_email_result=is_email_query,
+                match_display_name=is_email_query,
+            )
+
+        if contact is None and not is_portal_customer_id(account_id):
+            contact = find_contact_by_query(account_id, is_email_query=False)
+        if contact is None and email:
+            contact = find_contact_by_query(email, is_email_query=True)
 
         if contact is None:
-            email = customer.get("emailAddress") or customer.get("email") or ""
-            is_customer_contact = is_portal_customer_id(account_id) or str(
-                customer.get("accountType") or customer.get("account_type") or ""
-            ).casefold() == "customer"
-            fallback_contact: dict[str, Any] = {
+            fallback_contact = {
                 "accountId": account_id,
                 "identifier": account_id,
-                "accountType": "customer" if is_customer_contact else (customer.get("accountType") or "unknown"),
+                "accountType": "customer"
+                if is_customer_contact
+                else (customer.get("accountType") or "unknown"),
                 "loggedInStatus": "UNKNOWN",
                 "agent": False if is_customer_contact else True,
             }
-            if email:
-                alt_query = urllib.parse.urlencode({"query": email})
-                alt_url = (
-                    f"{config['site']}/rest/servicedesk/1/project/"
-                    f"{urllib.parse.quote(str(resolved_project_id), safe='')}/contacts?"
-                    f"{alt_query}"
-                )
-                try:
-                    alt_response = request_json(alt_url, api="jira", headers=headers)
-                    alt_values, _ = _parse_contact_page(alt_response)
-                    alt_contact = next(
-                        (
-                            item
-                            for item in alt_values
-                            if isinstance(item, dict)
-                            and (
-                                str(item.get("identifier") or item.get("accountId") or "").casefold()
-                                == account_id.casefold()
-                                or str(item.get("email") or item.get("emailAddress") or "").casefold()
-                                == email.casefold()
-                            )
-                        ),
-                        None,
-                    )
-                    if alt_contact is not None:
-                        contact = alt_contact
-                        contact_cache[key] = contact
-                        return {**customer, **contact}
-                except ApiError:
-                    pass
             contact_cache[key] = fallback_contact
             return {**customer, **fallback_contact}
         contact_cache[key] = contact
@@ -1063,6 +1248,14 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
             if is_portal_customer_id(account_id) or str(
                 customer.get("accountType") or customer.get("account_type") or ""
             ).casefold() == "customer":
+                if customer.get("agent") is not False:
+                    row["reason"] = (
+                        "contact is an agent and not a customer"
+                        if customer.get("agent") is True
+                        else "contact agent status is missing or invalid"
+                    )
+                    rows.append(row)
+                    continue
                 if status == "pending_login":
                     pending_portal_candidates.append((row, desk_id, account_id))
                 elif status == "logged_in":

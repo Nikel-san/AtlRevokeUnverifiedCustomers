@@ -32,7 +32,7 @@ class PerformanceOptimizationTests(unittest.TestCase):
 
     def test_public_customer_pages_are_enriched_with_contact_details(self) -> None:
         page_starts: list[int] = []
-        contact_queries: list[str] = []
+        contact_page_starts: list[int] = []
         lock = threading.Lock()
 
         def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
@@ -56,22 +56,26 @@ class PerformanceOptimizationTests(unittest.TestCase):
                     ],
                 }
 
-            self.assertIn(
-                "/rest/servicedesk/1/project/34/contacts", parsed_url.path
+            self.assertEqual(
+                parsed_url.path, "/rest/servicedesk/1/project/34/contacts"
             )
-            account_id = params["query"][0]
-            self.assertNotIn("start", params)
-            self.assertNotIn("limit", params)
+            start = int(params["start"][0])
             with lock:
-                contact_queries.append(account_id)
+                contact_page_starts.append(start)
+            end = min(start + app.PROJECT_CONTACT_PAGE_SIZE, 103)
             return {
                 "contactResults": [
                     {
-                        "identifier": account_id,
+                        "identifier": f"user-{index}",
                         "loggedInStatus": "PENDING_LOGIN",
                         "agent": False,
                     }
-                ]
+                    for index in range(start, end)
+                ],
+                "contactPageMetadata": {
+                    "start": start,
+                    "total": 103,
+                },
             }
 
         config = {
@@ -83,7 +87,7 @@ class PerformanceOptimizationTests(unittest.TestCase):
             contacts = app.list_customers(config, "12", project_id="34")
 
         self.assertEqual(page_starts, [0, 50, 100])
-        self.assertCountEqual(contact_queries, [f"user-{index}" for index in range(103)])
+        self.assertEqual(contact_page_starts, [0, 100])
         self.assertEqual(len(contacts), 103)
         self.assertTrue(all(contact["agent"] is False for contact in contacts))
         self.assertTrue(
@@ -107,6 +111,22 @@ class PerformanceOptimizationTests(unittest.TestCase):
         with mock.patch.object(app, "request_json", side_effect=fake_request):
             with self.assertRaisesRegex(app.ApiError, "pagination repeated a page"):
                 app.list_customers(config, "12", project_id="34")
+
+    def test_repeated_project_contact_page_fails(self) -> None:
+        contact = {
+            "identifier": "account-1",
+            "loggedInStatus": "PENDING_LOGIN",
+            "agent": False,
+        }
+        config = {"site": "https://example.test"}
+
+        with mock.patch.object(
+            app,
+            "request_json",
+            return_value={"contactResults": [contact], "isLastPage": False},
+        ):
+            with self.assertRaisesRegex(app.ApiError, "pagination repeated a page"):
+                app._list_project_contacts(config, "34", {})
 
     def test_portal_customer_without_contact_record_is_not_assumed_pending_login(self) -> None:
         def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
@@ -154,13 +174,106 @@ class PerformanceOptimizationTests(unittest.TestCase):
             self.assertEqual(
                 parsed_url.path, "/rest/servicedesk/1/project/34/contacts"
             )
-            self.assertEqual(
-                urllib.parse.parse_qs(parsed_url.query), {"query": [account_id]}
-            )
+            self.assertNotIn("query", urllib.parse.parse_qs(parsed_url.query))
             return {
                 "contactResults": [
                     {
                         "identifier": account_id,
+                        "loggedInStatus": "PENDING_LOGIN",
+                        "agent": False,
+                    }
+                ],
+                "isLastPage": True,
+            }
+
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            contacts = app.list_customers(config, "12", project_id="34")
+
+        self.assertEqual(len(contacts), 1)
+        self.assertEqual(contacts[0]["loggedInStatus"], "PENDING_LOGIN")
+        self.assertFalse(contacts[0]["agent"])
+
+    def test_portal_customer_bulk_contact_matches_by_unique_display_name(self) -> None:
+        account_id = "qm:test-portal-account"
+
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            parsed_url = urllib.parse.urlsplit(url)
+            if "/rest/servicedeskapi/servicedesk/12/customer" in parsed_url.path:
+                return {
+                    "start": 0,
+                    "limit": 50,
+                    "isLastPage": True,
+                    "values": [
+                        {
+                            "accountId": account_id,
+                            "emailAddress": "portal@example.test",
+                            "displayName": "Portal Customer",
+                        }
+                    ],
+                }
+
+            params = urllib.parse.parse_qs(parsed_url.query)
+            self.assertNotIn("query", params)
+            return {
+                "contactResults": [
+                    {
+                        "identifier": "712020:cloud-account",
+                        "displayName": "Portal Customer",
+                        "loggedInStatus": "PENDING_LOGIN",
+                        "agent": False,
+                    }
+                ],
+                "isLastPage": True,
+            }
+
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            contacts = app.list_customers(config, "12", project_id="34")
+
+        self.assertEqual(len(contacts), 1)
+        self.assertEqual(contacts[0]["loggedInStatus"], "PENDING_LOGIN")
+        self.assertFalse(contacts[0]["agent"])
+
+    def test_portal_email_lookup_accepts_single_redacted_result(self) -> None:
+        account_id = "qm:test-portal-account"
+        email = "portal@example.test"
+        queries: list[str] = []
+
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            parsed_url = urllib.parse.urlsplit(url)
+            if "/rest/servicedeskapi/servicedesk/12/customer" in parsed_url.path:
+                return {
+                    "start": 0,
+                    "limit": 50,
+                    "isLastPage": True,
+                    "values": [
+                        {
+                            "accountId": account_id,
+                            "emailAddress": email,
+                            "displayName": "Portal Customer",
+                        }
+                    ],
+                }
+
+            params = urllib.parse.parse_qs(parsed_url.query)
+            if "query" not in params:
+                return {"contactResults": []}
+            queries.append(params["query"][0])
+            self.assertEqual(params["query"], [email])
+            return {
+                "contactResults": [
+                    {
+                        "identifier": "712020:cloud-account",
+                        "displayName": "Portal Customer",
                         "loggedInStatus": "PENDING_LOGIN",
                         "agent": False,
                     }
@@ -175,6 +288,7 @@ class PerformanceOptimizationTests(unittest.TestCase):
         with mock.patch.object(app, "request_json", side_effect=fake_request):
             contacts = app.list_customers(config, "12", project_id="34")
 
+        self.assertEqual(queries, [email])
         self.assertEqual(len(contacts), 1)
         self.assertEqual(contacts[0]["loggedInStatus"], "PENDING_LOGIN")
         self.assertFalse(contacts[0]["agent"])
@@ -210,7 +324,7 @@ class PerformanceOptimizationTests(unittest.TestCase):
         self.assertEqual(contacts[0]["loggedInStatus"], "UNKNOWN")
         self.assertFalse(contacts[0]["agent"])
 
-    def test_customer_contact_is_retried_by_email_when_account_id_lookup_misses(self) -> None:
+    def test_customer_contact_falls_back_to_email_after_account_id_miss(self) -> None:
         account_id = "customer-42"
         email = "customer@example.test"
         contact_queries: list[str] = []
@@ -231,7 +345,10 @@ class PerformanceOptimizationTests(unittest.TestCase):
                     ],
                 }
 
-            query = urllib.parse.parse_qs(parsed_url.query)["query"][0]
+            params = urllib.parse.parse_qs(parsed_url.query)
+            if "query" not in params:
+                return {"contactResults": []}
+            query = params["query"][0]
             contact_queries.append(query)
             if query == account_id:
                 return {"contactResults": []}
@@ -301,6 +418,90 @@ class PerformanceOptimizationTests(unittest.TestCase):
         with mock.patch.object(app, "request_json") as request_json:
             self.assertFalse(app.has_issues(config, "qm:test-portal-account"))
             request_json.assert_not_called()
+
+    def test_has_issues_only_queries_non_portal_accounts(self) -> None:
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+
+        with mock.patch.object(
+            app, "request_json", return_value={"total": 1}
+        ) as request_json:
+            results = app.has_issues_for_accounts(
+                config, ["qm:test-portal-account", "712020:standard-account"]
+            )
+
+        self.assertEqual(
+            results,
+            {"qm:test-portal-account": False, "712020:standard-account": True},
+        )
+        request_json.assert_called_once()
+        query = urllib.parse.urlsplit(request_json.call_args.args[0]).query
+        self.assertIn("712020%3Astandard-account", query)
+        self.assertNotIn("qm%3Atest-portal-account", query)
+
+    def test_portal_customer_safety_checks_control_removal(self) -> None:
+        args = app.parse_args(["-d", "12", "--dry-run"])
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+            "token": "not-used",
+            "org": "1",
+        }
+        for agent, action, reason in (
+            (True, "skipped", "contact is an agent and not a customer"),
+            (False, "would remove", ""),
+        ):
+            with self.subTest(agent=agent):
+                report_rows: list[dict[str, str]] = []
+                with (
+                    mock.patch.object(
+                        app,
+                        "request_json",
+                        return_value={
+                            "id": "12",
+                            "projectId": "34",
+                            "projectName": "HELP",
+                        },
+                    ),
+                    mock.patch.object(app, "load_org_users", return_value={}),
+                    mock.patch.object(
+                        app,
+                        "list_customers",
+                        return_value=[
+                            {
+                                "accountId": "qm:agent-contact",
+                                "email": "agent@example.test",
+                                "displayName": "Agent",
+                                "agent": agent,
+                                "loggedInStatus": "PENDING_LOGIN",
+                            }
+                        ],
+                    ),
+                    mock.patch.object(
+                        app,
+                        "write_report",
+                        side_effect=lambda rows, output=None: (
+                            report_rows.extend(rows) or app.Path("report.csv")
+                        ),
+                    ),
+                    mock.patch.object(
+                        app, "has_issues_for_accounts", return_value={}
+                    ) as has_issues,
+                ):
+                    result = app.process(args, config)
+
+                self.assertEqual(result, 0)
+                self.assertEqual(len(report_rows), 1)
+                self.assertEqual(report_rows[0]["action"], action)
+                self.assertEqual(report_rows[0]["reason"], reason)
+                account_ids = [] if agent else ["qm:agent-contact"]
+                has_issues.assert_called_once_with(
+                    config, account_ids, workers=args.workers
+                )
 
     def test_is_portal_only_allows_customer_without_org_entry(self) -> None:
         self.assertEqual(app.is_portal_only("customer", None, None), (True, ""))

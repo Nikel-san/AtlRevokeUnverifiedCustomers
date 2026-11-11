@@ -116,17 +116,22 @@ desk(s) only. It never deletes or deactivates Atlassian accounts.
 
 Customers are enumerated with the paginated
 `GET /rest/servicedeskapi/servicedesk/{serviceDeskId}/customer` endpoint.
-For each account, the script looks up its contact details using the
-`query` parameter on
-`GET /rest/servicedesk/1/project/{projectId}/contacts` to obtain
-`loggedInStatus` and `agent`. The latter endpoint is not used for offset
-pagination. The script requires `loggedInStatus: "PENDING_LOGIN"` and
-`agent: false` before considering a contact for removal. `--input-file`
-narrows the contacts processed but cannot override those safety checks.
-`LOGGED_IN`, missing/unknown statuses, agents, and contacts whose agent status
-is not explicitly `false` are skipped.
+The script first reads the project contacts endpoint in pages of 100 and
+indexes contacts by account ID, email, and unique normalized display name.
+This bulk lookup resolves each customer's `loggedInStatus` and `agent` without
+one search request per account. If a customer is not matched, it falls back to
+searches by account ID and email; portal IDs (`qm:`) are searched by email,
+not by their internal ID. A single result from an email search is accepted
+even when Jira redacts its email or returns a different identifier. Ambiguous
+display-name matches are not used. If bulk discovery is unavailable, the script
+warns and uses the per-account fallback.
+
+Removal requires both `loggedInStatus: "PENDING_LOGIN"` and `agent: false`.
+`--input-file` narrows the contacts processed but cannot override those safety
+checks. `LOGGED_IN`, missing/unknown statuses, agents, and contacts whose agent
+status is not explicitly `false` are skipped.
 
 Transient read-only GET failures (HTTP 429 and common 5xx responses) are
-retried with bounded backoff. HTTPS connections are reused, and the per-account
-contact lookups run with up to four concurrent requests. Removal requests are
-never automatically retried and are sent in batches of 50.
+retried with bounded backoff. HTTPS connections are reused, and fallback
+contact lookups run concurrently. Removal requests are never automatically
+retried and are sent in batches of 50.
