@@ -698,16 +698,6 @@ def list_customers(
         if contact_cache is not None and key in contact_cache:
             cached = contact_cache[key]
             return {**customer, **cached}
-        if is_portal_customer_id(account_id):
-            contact = {
-                "accountId": account_id,
-                "identifier": account_id,
-                "accountType": "customer",
-                "agent": False,
-                "loggedInStatus": "UNKNOWN",
-            }
-            contact_cache[key] = contact
-            return {**customer, **contact}
 
         contact_query = urllib.parse.urlencode({"query": account_id})
         contact_url = (

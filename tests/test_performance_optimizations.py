@@ -138,6 +138,47 @@ class PerformanceOptimizationTests(unittest.TestCase):
         self.assertEqual(contacts[0]["loggedInStatus"], "UNKNOWN")
         self.assertFalse(contacts[0]["agent"])
 
+    def test_portal_customer_contact_record_provides_its_status(self) -> None:
+        account_id = "qm:test-portal-account"
+
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            parsed_url = urllib.parse.urlsplit(url)
+            if "/rest/servicedeskapi/servicedesk/12/customer" in parsed_url.path:
+                return {
+                    "start": 0,
+                    "limit": 50,
+                    "isLastPage": True,
+                    "values": [{"accountId": account_id}],
+                }
+
+            self.assertEqual(
+                parsed_url.path, "/rest/servicedesk/1/project/34/contacts"
+            )
+            self.assertEqual(
+                urllib.parse.parse_qs(parsed_url.query), {"query": [account_id]}
+            )
+            return {
+                "contactResults": [
+                    {
+                        "identifier": account_id,
+                        "loggedInStatus": "PENDING_LOGIN",
+                        "agent": False,
+                    }
+                ]
+            }
+
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            contacts = app.list_customers(config, "12", project_id="34")
+
+        self.assertEqual(len(contacts), 1)
+        self.assertEqual(contacts[0]["loggedInStatus"], "PENDING_LOGIN")
+        self.assertFalse(contacts[0]["agent"])
+
     def test_customer_type_without_contact_record_is_not_assumed_pending_login(self) -> None:
         def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
             parsed_url = urllib.parse.urlsplit(url)
