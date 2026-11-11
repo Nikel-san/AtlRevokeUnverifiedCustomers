@@ -588,6 +588,15 @@ def _normalized_contact_key(value: Any) -> str:
     return value.strip().casefold() if isinstance(value, str) else ""
 
 
+def _is_complete_contact(contact: dict[str, Any] | None) -> bool:
+    if not isinstance(contact, dict) or not isinstance(contact.get("agent"), bool):
+        return False
+    status = normalize_customer_status(
+        contact.get("loggedInStatus") or contact.get("logged_in_status")
+    )
+    return status in {"pending_login", "logged_in"}
+
+
 def _contact_identity(contact: dict[str, Any]) -> tuple[str, ...]:
     return (
         _normalized_contact_key(contact.get("identifier")),
@@ -846,11 +855,14 @@ def list_customers(
             continue
         key = (str(resolved_project_id), account_id        )
         if key in contact_cache:
-            enriched_by_id[account_id.casefold()] = _merge_customer_contact(
-                customer, contact_cache[key]
-            )
-        else:
-            pending_customers.append(customer)
+            cached_contact = contact_cache[key]
+            if _is_complete_contact(cached_contact):
+                enriched_by_id[account_id.casefold()] = _merge_customer_contact(
+                    customer, cached_contact
+                )
+                continue
+            contact_cache.pop(key)
+        pending_customers.append(customer)
 
     contact_indexes = project_contact_cache.get(str(resolved_project_id))
     if pending_customers and contact_indexes is None:
@@ -902,6 +914,8 @@ def list_customers(
                     contact = index[lookup_key]
                     if contact is not None:
                         break
+        if not _is_complete_contact(contact):
+            contact = None
 
         def find_contact_by_query(
             query: str,
@@ -928,7 +942,7 @@ def list_customers(
                     "the customer will remain unverifiable unless another lookup succeeds."
                 )
                 return None
-            return _find_contact(
+            result = _find_contact(
                 contact_values,
                 account_id,
                 email if is_email_query else "",
@@ -936,6 +950,7 @@ def list_customers(
                 accept_single_email_result=is_email_query,
                 match_display_name=is_display_name_query,
             )
+            return result if _is_complete_contact(result) else None
 
         if contact is None and not is_portal_customer_id(account_id):
             contact = find_contact_by_query(account_id, is_email_query=False)
@@ -961,7 +976,6 @@ def list_customers(
                 "loggedInStatus": "UNKNOWN",
                 "agent": None,
             }
-            contact_cache[key] = fallback_contact
             return _merge_customer_contact(customer, fallback_contact)
         contact_cache[key] = contact
         return _merge_customer_contact(customer, contact)

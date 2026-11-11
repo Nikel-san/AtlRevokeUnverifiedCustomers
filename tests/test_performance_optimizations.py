@@ -652,6 +652,175 @@ class PerformanceOptimizationTests(unittest.TestCase):
         self.assertEqual(contacts[0]["loggedInStatus"], "PENDING_LOGIN")
         self.assertFalse(contacts[0]["agent"])
 
+    def test_incomplete_bulk_contact_retries_individual_lookup(self) -> None:
+        account_id = "qm:incomplete-bulk"
+        email = "portal@example.test"
+        for missing_field in ("agent", "loggedInStatus"):
+            with self.subTest(missing_field=missing_field):
+                queries: list[str] = []
+
+                def fake_request(
+                    url: str, *, api: str, headers: dict[str, str]
+                ) -> dict:
+                    parsed_url = urllib.parse.urlsplit(url)
+                    if "/rest/servicedeskapi/servicedesk/12/customer" in parsed_url.path:
+                        return {
+                            "isLastPage": True,
+                            "values": [
+                                {
+                                    "accountId": account_id,
+                                    "emailAddress": email,
+                                    "displayName": "Portal Customer",
+                                }
+                            ],
+                        }
+
+                    params = urllib.parse.parse_qs(parsed_url.query)
+                    if not params:
+                        bulk_contact = {
+                            "identifier": account_id,
+                            "loggedInStatus": "PENDING_LOGIN",
+                            "agent": False,
+                        }
+                        del bulk_contact[missing_field]
+                        return {"contactResults": [bulk_contact]}
+
+                    query = params["query"][0]
+                    queries.append(query)
+                    return {
+                        "contactResults": [
+                            {
+                                "identifier": "contact-id",
+                                "loggedInStatus": "PENDING_LOGIN",
+                                "agent": False,
+                            }
+                        ]
+                    }
+
+                with mock.patch.object(app, "request_json", side_effect=fake_request):
+                    contacts = app.list_customers(
+                        {
+                            "site": "https://example.test",
+                            "jira_email": "user@example.test",
+                            "jira_pat": "not-used",
+                        },
+                        "12",
+                        project_id="34",
+                    )
+
+                self.assertEqual(queries, [email])
+                self.assertEqual(contacts[0]["loggedInStatus"], "PENDING_LOGIN")
+                self.assertIs(contacts[0]["agent"], False)
+                self.assertTrue(contacts[0]["contactAgentVerified"])
+
+    def test_incomplete_individual_contact_is_not_cached_as_resolved(self) -> None:
+        account_id = "qm:incomplete-individual"
+        email = "portal@example.test"
+        queries: list[str] = []
+        contact_cache: dict[tuple[str, str], dict] = {}
+
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            parsed_url = urllib.parse.urlsplit(url)
+            if "/rest/servicedeskapi/servicedesk/12/customer" in parsed_url.path:
+                return {
+                    "isLastPage": True,
+                    "values": [
+                        {
+                            "accountId": account_id,
+                            "emailAddress": email,
+                            "displayName": "Portal Customer",
+                        }
+                    ],
+                }
+
+            params = urllib.parse.parse_qs(parsed_url.query)
+            if not params:
+                return {
+                    "contactResults": [
+                        {
+                            "identifier": account_id,
+                            "loggedInStatus": "PENDING_LOGIN",
+                        }
+                    ]
+                }
+            queries.append(params["query"][0])
+            return {
+                "contactResults": [
+                    {
+                        "identifier": "contact-id",
+                        "loggedInStatus": "PENDING_LOGIN",
+                    }
+                ]
+            }
+
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            contacts = app.list_customers(
+                {
+                    "site": "https://example.test",
+                    "jira_email": "user@example.test",
+                    "jira_pat": "not-used",
+                },
+                "12",
+                project_id="34",
+                contact_cache=contact_cache,
+            )
+
+        self.assertEqual(queries, [email, "Portal Customer"])
+        self.assertNotIn(("34", account_id), contact_cache)
+        self.assertEqual(contacts[0]["loggedInStatus"], "UNKNOWN")
+        self.assertIsNone(contacts[0]["agent"])
+        self.assertFalse(contacts[0]["contactAgentVerified"])
+
+    def test_http_500_after_incomplete_bulk_contact_remains_ineligible(self) -> None:
+        account_id = "qm:unverifiable-after-500"
+        email = "portal@example.test"
+
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            parsed_url = urllib.parse.urlsplit(url)
+            if "/rest/servicedeskapi/servicedesk/12/customer" in parsed_url.path:
+                return {
+                    "isLastPage": True,
+                    "values": [
+                        {
+                            "accountId": account_id,
+                            "emailAddress": email,
+                            "displayName": "Portal Customer",
+                        }
+                    ],
+                }
+
+            params = urllib.parse.parse_qs(parsed_url.query)
+            if not params:
+                return {
+                    "contactResults": [
+                        {
+                            "identifier": account_id,
+                            "loggedInStatus": "PENDING_LOGIN",
+                        }
+                    ]
+                }
+            raise app.ApiError("jira", "HTTP 500", 500)
+
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            contacts = app.list_customers(
+                {
+                    "site": "https://example.test",
+                    "jira_email": "user@example.test",
+                    "jira_pat": "not-used",
+                },
+                "12",
+                project_id="34",
+            )
+
+        result, rows, _, _, _ = self.run_process_with_customers(
+            contacts, {account_id: False}
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(rows[0]["action"], "skipped")
+        self.assertEqual(
+            rows[0]["reason"], "contact agent status is missing or invalid"
+        )
+
     def test_portal_email_lookup_accepts_single_redacted_result(self) -> None:
         account_id = "qm:test-portal-account"
         email = "portal@example.test"
