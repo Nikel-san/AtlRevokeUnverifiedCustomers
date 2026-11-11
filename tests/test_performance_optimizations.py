@@ -210,6 +210,56 @@ class PerformanceOptimizationTests(unittest.TestCase):
         self.assertEqual(contacts[0]["loggedInStatus"], "UNKNOWN")
         self.assertFalse(contacts[0]["agent"])
 
+    def test_customer_contact_is_retried_by_email_when_account_id_lookup_misses(self) -> None:
+        account_id = "customer-42"
+        email = "customer@example.test"
+        contact_queries: list[str] = []
+
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            parsed_url = urllib.parse.urlsplit(url)
+            if "/rest/servicedeskapi/servicedesk/12/customer" in parsed_url.path:
+                return {
+                    "start": 0,
+                    "limit": 50,
+                    "isLastPage": True,
+                    "values": [
+                        {
+                            "accountId": account_id,
+                            "emailAddress": email,
+                            "accountType": "customer",
+                        }
+                    ],
+                }
+
+            query = urllib.parse.parse_qs(parsed_url.query)["query"][0]
+            contact_queries.append(query)
+            if query == account_id:
+                return {"contactResults": []}
+            self.assertEqual(query, email)
+            return {
+                "contactResults": [
+                    {
+                        "identifier": account_id,
+                        "email": email,
+                        "loggedInStatus": "PENDING_LOGIN",
+                        "agent": False,
+                    }
+                ]
+            }
+
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            contacts = app.list_customers(config, "12", project_id="34")
+
+        self.assertEqual(contact_queries, [account_id, email])
+        self.assertEqual(len(contacts), 1)
+        self.assertEqual(contacts[0]["loggedInStatus"], "PENDING_LOGIN")
+        self.assertFalse(contacts[0]["agent"])
+
     def test_unresolvable_atlassian_customer_is_skipped_without_crashing(self) -> None:
         def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
             parsed_url = urllib.parse.urlsplit(url)

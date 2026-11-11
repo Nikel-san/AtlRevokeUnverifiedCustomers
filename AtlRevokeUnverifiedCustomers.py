@@ -733,7 +733,7 @@ def list_customers(
                 "loggedInStatus": "UNKNOWN",
                 "agent": False if is_customer_contact else True,
             }
-            if email and not is_customer_contact:
+            if email:
                 alt_query = urllib.parse.urlencode({"query": email})
                 alt_url = (
                     f"{config['site']}/rest/servicedesk/1/project/"
