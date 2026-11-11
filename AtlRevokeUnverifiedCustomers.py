@@ -859,7 +859,7 @@ def list_customers(
                 config, str(resolved_project_id), headers
             )
         except ApiError as error:
-            if error.status in {401, 403, 429, 500, 502, 503, 504}:
+            if error.status in {401, 403}:
                 raise
             warn(
                 f"Bulk contact discovery failed ({error}); "
@@ -918,8 +918,12 @@ def list_customers(
                 )
                 contact_values, _ = _parse_contact_page(contact_response)
             except ApiError as error:
-                if error.status in {401, 403, 429, 500, 502, 503, 504}:
+                if error.status in {401, 403}:
                     raise
+                warn(
+                    f"Individual contact lookup failed ({error}); "
+                    "the customer will remain unverifiable unless another lookup succeeds."
+                )
                 return None
             return _find_contact(
                 contact_values,

@@ -786,6 +786,69 @@ class PerformanceOptimizationTests(unittest.TestCase):
         self.assertEqual(contacts[0]["loggedInStatus"], "PENDING_LOGIN")
         self.assertFalse(contacts[0]["agent"])
 
+    def test_transient_contact_query_failure_does_not_abort_customer_processing(self) -> None:
+        unresolved_email = "unavailable@example.test"
+        resolved_email = "available@example.test"
+        requested_queries: list[str] = []
+
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            parsed_url = urllib.parse.urlsplit(url)
+            if "/rest/servicedeskapi/servicedesk/12/customer" in parsed_url.path:
+                return {
+                    "isLastPage": True,
+                    "values": [
+                        {
+                            "accountId": "qm:unavailable",
+                            "emailAddress": unresolved_email,
+                        },
+                        {
+                            "accountId": "qm:available",
+                            "emailAddress": resolved_email,
+                        },
+                    ],
+                }
+            if parsed_url.path.endswith("/contacts") and not parsed_url.query:
+                raise app.ApiError("jira", "HTTP 500", 500)
+
+            query = urllib.parse.parse_qs(parsed_url.query)["query"][0]
+            requested_queries.append(query)
+            if query == unresolved_email:
+                raise app.ApiError("jira", "HTTP 500", 500)
+            if query == resolved_email:
+                return {
+                    "contactResults": [
+                        {
+                            "identifier": "contact-available",
+                            "loggedInStatus": "PENDING_LOGIN",
+                            "agent": False,
+                        }
+                    ]
+                }
+            self.fail(f"unexpected contact query: {query}")
+
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            customers = app.list_customers(config, "12", project_id="34")
+
+        self.assertEqual(requested_queries, [unresolved_email, resolved_email])
+        self.assertEqual(len(customers), 2)
+        unresolved = next(
+            customer for customer in customers if customer["accountId"] == "qm:unavailable"
+        )
+        resolved = next(
+            customer for customer in customers if customer["accountId"] == "qm:available"
+        )
+        self.assertEqual(unresolved["loggedInStatus"], "UNKNOWN")
+        self.assertIsNone(unresolved["agent"])
+        self.assertFalse(unresolved["contactAgentVerified"])
+        self.assertEqual(resolved["loggedInStatus"], "PENDING_LOGIN")
+        self.assertIs(resolved["agent"], False)
+        self.assertTrue(resolved["contactAgentVerified"])
+
     def test_unresolvable_atlassian_customer_is_skipped_without_crashing(self) -> None:
         def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
             parsed_url = urllib.parse.urlsplit(url)
