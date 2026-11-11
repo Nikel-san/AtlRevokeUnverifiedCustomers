@@ -33,6 +33,7 @@ REMOVE_BATCH_SIZE = 50
 CONTACT_PAGE_SIZE = 50
 PROJECT_CONTACT_PAGE_SIZE = 100
 CONTACT_PAGE_WORKERS = 8
+MAX_CONCURRENT_WORKERS = 32
 REQUEST_TIMEOUT = 30
 MAX_READ_RETRIES = 3
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
@@ -53,6 +54,95 @@ ANSI_GREEN = "\033[32m"
 _connection_local = threading.local()
 _connections: set[http.client.HTTPConnection] = set()
 _connections_lock = threading.Lock()
+_metrics_lock = threading.Lock()
+_metrics: dict[str, Any] = {}
+
+
+def _reset_metrics() -> None:
+    global _metrics
+    with _metrics_lock:
+        _metrics = {
+            "requests": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "http_429": 0,
+            "http_5xx": 0,
+            "api_elapsed_seconds": 0.0,
+            "categories": {},
+            "contact_cache_hits": 0,
+            "contact_cache_misses": 0,
+            "individual_contact_lookups": 0,
+            "bulk_contact_lookups": 0,
+            "issue_history_lookups": 0,
+        }
+
+
+def _metric_increment(name: str, amount: int = 1) -> None:
+    with _metrics_lock:
+        _metrics[name] = _metrics.get(name, 0) + amount
+
+
+def _api_category(path: str, method: str, api: str) -> str:
+    parsed_path = urllib.parse.urlsplit(path)
+    if method.upper() == "DELETE":
+        return "jira.customer-removal"
+    if parsed_path.path.endswith("/contacts"):
+        return (
+            "jira.project-contacts.individual"
+            if parsed_path.query
+            else "jira.project-contacts.bulk"
+        )
+    if parsed_path.path.endswith("/search"):
+        return "jira.issue-history"
+    if parsed_path.path.endswith("/customer"):
+        return "jira.customer-list"
+    if "/rest/api/3/user" in parsed_path.path:
+        return "jira.user-profile"
+    if "/rest/servicedeskapi/servicedesk" in parsed_path.path:
+        return "jira.service-desk"
+    if api == "organization":
+        return "organization.directory"
+    return f"{api}.other"
+
+
+def _record_api_request(
+    category: str, elapsed: float, status: int | None, succeeded: bool
+) -> None:
+    with _metrics_lock:
+        category_metrics = _metrics.setdefault("categories", {}).setdefault(
+            category,
+            {"requests": 0, "successful": 0, "failed": 0, "elapsed_seconds": 0.0},
+        )
+        _metrics["requests"] = _metrics.get("requests", 0) + 1
+        _metrics["api_elapsed_seconds"] = (
+            _metrics.get("api_elapsed_seconds", 0.0) + elapsed
+        )
+        category_metrics["requests"] += 1
+        category_metrics["elapsed_seconds"] += elapsed
+        if succeeded:
+            _metrics["successful_requests"] += 1
+            category_metrics["successful"] += 1
+        else:
+            _metrics["failed_requests"] += 1
+            category_metrics["failed"] += 1
+        if status == 429:
+            _metrics["http_429"] += 1
+        if status is not None and 500 <= status <= 599:
+            _metrics["http_5xx"] += 1
+
+
+def _metrics_snapshot() -> dict[str, Any]:
+    with _metrics_lock:
+        return {
+            **_metrics,
+            "categories": {
+                category: dict(counts)
+                for category, counts in _metrics.get("categories", {}).items()
+            },
+        }
+
+
+_reset_metrics()
 
 
 class ApiError(Exception):
@@ -158,7 +248,11 @@ def request_json(
         request_headers["Content-Type"] = "application/json"
         payload = json.dumps(body).encode("utf-8")
     retryable = method.upper() == "GET"
+    category = _api_category(request_path, method, api)
     for attempt in range(MAX_READ_RETRIES + 1):
+        attempt_started = time.perf_counter()
+        status: int | None = None
+        succeeded = False
         connection = _get_connection(parsed_url.scheme, host, port)
         try:
             connection.request(
@@ -168,6 +262,7 @@ def request_json(
                 headers=request_headers,
             )
             response = connection.getresponse()
+            status = response.status
             response_body = response.read()
             if response.status >= 400:
                 if (
@@ -178,6 +273,7 @@ def request_json(
                     time.sleep(_retry_delay(attempt, response.headers))
                     continue
                 raise ApiError(api, f"HTTP {response.status}", response.status)
+            succeeded = True
             break
         except ApiError:
             raise
@@ -187,6 +283,13 @@ def request_json(
                 time.sleep(_retry_delay(attempt))
                 continue
             raise ApiError(api, f"request failed: {request_error}") from None
+        finally:
+            _record_api_request(
+                category,
+                time.perf_counter() - attempt_started,
+                status,
+                succeeded,
+            )
 
     if not response_body:
         return {}
@@ -694,6 +797,10 @@ def list_customers(
     input_filter_enabled: bool = False,
     exclude_ids: set[str] | None = None,
     contact_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
+    project_contact_cache: dict[
+        str, tuple[dict[str, dict[str, Any] | None], ...]
+    ]
+    | None = None,
     workers: int = CONTACT_PAGE_WORKERS,
 ) -> list[dict[str, Any]]:
     resolved_project_id = project_id or resolve_service_desk_project_id(
@@ -823,31 +930,60 @@ def list_customers(
         sys.stderr.flush()
 
     contact_cache = contact_cache if contact_cache is not None else {}
+    project_contact_cache = (
+        project_contact_cache if project_contact_cache is not None else {}
+    )
     customers_to_enrich = [
         customer for customer in customers if not customer.get("_filter_reason")
     ]
     if not customers_to_enrich:
         return customers
-    bulk_contact_error = False
-    try:
-        project_contacts = _list_project_contacts(
-            config, str(resolved_project_id), headers
+
+    pending_customers: list[dict[str, Any]] = []
+    enriched_by_id: dict[str, dict[str, Any]] = {}
+    for customer in customers_to_enrich:
+        account_id = str(
+            customer.get("accountId") or customer.get("identifier") or ""
         )
-    except ApiError as error:
-        if error.status in {401, 403, 429, 500, 502, 503, 504}:
-            raise
-        warn(
-            f"Bulk contact discovery failed ({error}); "
-            "falling back to contact searches."
-        )
-        project_contacts = []
-        bulk_contact_error = True
-    if customers_to_enrich and not project_contacts and not bulk_contact_error:
-        warn(
-            "Bulk contact discovery returned no contacts; "
-            "falling back to contact searches."
-        )
-    contact_indexes = _index_project_contacts(project_contacts)
+        if not account_id:
+            enriched_by_id[""] = customer
+            continue
+        key = (str(resolved_project_id), account_id)
+        if key in contact_cache:
+            _metric_increment("contact_cache_hits")
+            enriched_by_id[account_id.casefold()] = _merge_customer_contact(
+                customer, contact_cache[key]
+            )
+        else:
+            _metric_increment("contact_cache_misses")
+            pending_customers.append(customer)
+
+    contact_indexes = project_contact_cache.get(str(resolved_project_id))
+    if pending_customers and contact_indexes is None:
+        _metric_increment("bulk_contact_lookups")
+        try:
+            project_contacts = _list_project_contacts(
+                config, str(resolved_project_id), headers
+            )
+        except ApiError as error:
+            if error.status in {401, 403, 429, 500, 502, 503, 504}:
+                raise
+            warn(
+                f"Bulk contact discovery failed ({error}); "
+                "falling back to contact searches."
+            )
+            project_contacts = []
+        else:
+            project_contact_cache[str(resolved_project_id)] = _index_project_contacts(
+                project_contacts
+            )
+        contact_indexes = _index_project_contacts(project_contacts)
+        project_contact_cache[str(resolved_project_id)] = contact_indexes
+        if not project_contacts:
+            warn(
+                "Bulk contact discovery returned no contacts; "
+                "falling back to contact searches."
+            )
 
     def fetch_contact_details(customer: dict[str, Any]) -> dict[str, Any]:
         account_id = str(
@@ -856,10 +992,6 @@ def list_customers(
         if not account_id:
             return customer
         key = (str(resolved_project_id), account_id)
-        if contact_cache is not None and key in contact_cache:
-            cached = contact_cache[key]
-            return _merge_customer_contact(customer, cached)
-
         email = str(customer.get("emailAddress") or customer.get("email") or "")
         display_name = str(customer.get("displayName") or "")
         is_customer_contact = is_portal_customer_id(account_id) or str(
@@ -869,17 +1001,19 @@ def list_customers(
         email_key = _normalized_contact_key(email)
         name_key = _normalized_contact_key(display_name)
         contact = None
-        for index, lookup_key in zip(
-            contact_indexes, (account_key, email_key, name_key)
-        ):
-            if lookup_key and lookup_key in index:
-                contact = index[lookup_key]
-                if contact is not None:
-                    break
+        if contact_indexes is not None:
+            for index, lookup_key in zip(
+                contact_indexes, (account_key, email_key, name_key)
+            ):
+                if lookup_key and lookup_key in index:
+                    contact = index[lookup_key]
+                    if contact is not None:
+                        break
 
         def find_contact_by_query(
             query: str, *, is_email_query: bool
         ) -> dict[str, Any] | None:
+            _metric_increment("individual_contact_lookups")
             contact_query = urllib.parse.urlencode({"query": query})
             contact_url = (
                 f"{config['site']}/rest/servicedesk/1/project/"
@@ -923,27 +1057,35 @@ def list_customers(
         return _merge_customer_contact(customer, contact)
 
     contacts: list[dict[str, Any]] = []
-    worker_count = max(1, int(workers or CONTACT_PAGE_WORKERS))
-    enriched_by_id: dict[str, dict[str, Any]] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-        chunk_size = max(1, worker_count * 4)
-        for offset in range(0, len(customers_to_enrich), chunk_size):
-            batch = customers_to_enrich[offset : offset + chunk_size]
-            for contact in executor.map(fetch_contact_details, batch):
-                contacts.append(contact)
-                customer_id = str(
-                    contact.get("accountId") or contact.get("customerAccountId") or ""
-                ).casefold()
-                enriched_by_id[customer_id] = contact
-                if is_tty:
-                    sys.stderr.write(
-                        f"\rResolving contact details: {len(contacts)}/{len(customers_to_enrich)}..."
-                    )
-                    sys.stderr.flush()
-                elif len(contacts) % 500 == 0:
-                    sys.stderr.write(
-                        f"Resolved contact details: {len(contacts)}/{len(customers)}.\n"
-                    )
+    worker_count = min(
+        MAX_CONCURRENT_WORKERS, max(1, int(workers))
+    )
+    if pending_customers:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(worker_count, len(pending_customers))
+        ) as executor:
+            chunk_size = max(1, worker_count * 4)
+            for offset in range(0, len(pending_customers), chunk_size):
+                batch = pending_customers[offset : offset + chunk_size]
+                for contact in executor.map(fetch_contact_details, batch):
+                    contacts.append(contact)
+                    customer_id = str(
+                        contact.get("accountId")
+                        or contact.get("customerAccountId")
+                        or ""
+                    ).casefold()
+                    enriched_by_id[customer_id] = contact
+                    if is_tty:
+                        sys.stderr.write(
+                            "\rResolving contact details: "
+                            f"{len(contacts)}/{len(pending_customers)}..."
+                        )
+                        sys.stderr.flush()
+                    elif len(contacts) % 500 == 0:
+                        sys.stderr.write(
+                            f"Resolved contact details: {len(contacts)}/"
+                            f"{len(pending_customers)}.\n"
+                        )
     if is_tty and customers:
         sys.stderr.write("\n")
         sys.stderr.flush()
@@ -978,6 +1120,7 @@ def is_portal_customer_id(account_id: str) -> bool:
 def has_issues(config: dict[str, str], account_id: str) -> bool | None:
     if not account_id or is_portal_customer_id(account_id):
         return False
+    _metric_increment("issue_history_lookups")
     query = f'reporter = "{account_id}" OR creator = "{account_id}"'
     encoded_query = urllib.parse.quote(query)
     try:
@@ -1008,38 +1151,45 @@ def has_issues_for_accounts(
     if not account_ids:
         return {}
     results: dict[str, bool | None] = {}
-    worker_count = max(1, min(len(account_ids), workers or CONTACT_PAGE_WORKERS))
+    worker_count = min(
+        len(account_ids),
+        MAX_CONCURRENT_WORKERS,
+        max(1, workers),
+    )
     with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = {
-            executor.submit(has_issues, config, account_id): account_id
-            for account_id in account_ids
-        }
-        for future in concurrent.futures.as_completed(futures):
-            account_id = futures[future]
-            try:
-                result = future.result()
-                if result is True or result is False or result is None:
-                    results[account_id] = result
-                else:
+        chunk_size = max(1, worker_count * 4)
+        for offset in range(0, len(account_ids), chunk_size):
+            batch = account_ids[offset : offset + chunk_size]
+            futures = {
+                executor.submit(has_issues, config, account_id): account_id
+                for account_id in batch
+            }
+            for future in concurrent.futures.as_completed(futures):
+                account_id = futures[future]
+                try:
+                    result = future.result()
+                    if result is True or result is False or result is None:
+                        results[account_id] = result
+                    else:
+                        warn(
+                            f"Issue verification returned an invalid result for "
+                            f"{account_id}; the customer will be skipped."
+                        )
+                        results[account_id] = None
+                except ApiError as error:
+                    if error.status in {401, 403}:
+                        raise
                     warn(
-                        f"Issue verification returned an invalid result for "
-                        f"{account_id}; the customer will be skipped."
+                        f"Issue verification failed for {account_id} ({error}); "
+                        "the customer will be skipped."
                     )
                     results[account_id] = None
-            except ApiError as error:
-                if error.status in {401, 403}:
-                    raise
-                warn(
-                    f"Issue verification failed for {account_id} ({error}); "
-                    "the customer will be skipped."
-                )
-                results[account_id] = None
-            except Exception as error:
-                warn(
-                    f"Issue verification failed for {account_id} ({error}); "
-                    "the customer will be skipped."
-                )
-                results[account_id] = None
+                except Exception as error:
+                    warn(
+                        f"Issue verification failed for {account_id} ({error}); "
+                        "the customer will be skipped."
+                    )
+                    results[account_id] = None
     return results
 
 
@@ -1181,7 +1331,42 @@ def print_row(row: dict[str, str]) -> None:
     )
 
 
+def print_metrics(execution_seconds: float) -> None:
+    metrics = _metrics_snapshot()
+    print("Performance metrics:")
+    print(
+        "  API requests: "
+        f"{metrics['requests']} total, "
+        f"{metrics['successful_requests']} successful, "
+        f"{metrics['failed_requests']} failed; "
+        f"429={metrics['http_429']}, 5xx={metrics['http_5xx']}"
+    )
+    print(
+        "  API time: "
+        f"{metrics['api_elapsed_seconds']:.2f}s; "
+        f"execution time: {execution_seconds:.2f}s"
+    )
+    print(
+        "  Contact lookups: "
+        f"bulk={metrics['bulk_contact_lookups']}, "
+        f"individual={metrics['individual_contact_lookups']}, "
+        f"cache hits={metrics['contact_cache_hits']}, "
+        f"cache misses={metrics['contact_cache_misses']}"
+    )
+    print(f"  Issue-history lookups: {metrics['issue_history_lookups']}")
+    if metrics["categories"]:
+        print("  Requests by category:")
+        for category, counts in sorted(metrics["categories"].items()):
+            print(
+                f"    {category}: {counts['requests']} total, "
+                f"{counts['successful']} successful, {counts['failed']} failed, "
+                f"{counts['elapsed_seconds']:.2f}s"
+            )
+
+
 def process(args: argparse.Namespace, config: dict[str, str]) -> int:
+    _reset_metrics()
+    execution_started = time.perf_counter()
     if args.out:
         report_path = Path(args.out)
         if report_path.exists():
@@ -1217,6 +1402,20 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
     error_count = 0
     org_users: dict[str, dict[str, Any]] | None = None
     contact_cache: dict[tuple[str, str], dict[str, Any]] = {}
+    project_contact_cache: dict[
+        str, tuple[dict[str, dict[str, Any] | None], ...]
+    ] = {}
+    contact_workers = min(
+        MAX_CONCURRENT_WORKERS,
+        max(
+            1,
+            args.workers if args.contact_workers is None else args.contact_workers,
+        ),
+    )
+    issue_workers = min(
+        MAX_CONCURRENT_WORKERS,
+        max(1, args.workers if args.issue_workers is None else args.issue_workers),
+    )
 
     for desk in desks:
         desk_id = str(desk.get("id", ""))
@@ -1235,7 +1434,8 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
             input_filter_enabled=input_mode,
             exclude_ids=excluded_ids,
             contact_cache=contact_cache,
-            workers=args.workers,
+            project_contact_cache=project_contact_cache,
+            workers=contact_workers,
         )
         for customer in customers:
             account_id = str(
@@ -1355,7 +1555,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
     issue_results = has_issues_for_accounts(
         config,
         [account_id for _, _, account_id in eligible_candidates],
-        workers=args.workers,
+        workers=issue_workers,
     )
     candidates: list[tuple[dict[str, str], str, str]] = []
     for row, desk_id, account_id in eligible_candidates:
@@ -1438,6 +1638,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
     print(f"  Removed: {removed_count}")
     print(f"  Skipped: {skipped_count}")
     print(f"  Errors: {error_count}")
+    print_metrics(time.perf_counter() - execution_started)
     success(f"CSV report written to {report_path}")
     return 1 if error_count else 0
 
@@ -1507,7 +1708,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--workers",
         type=int,
         default=CONTACT_PAGE_WORKERS,
-        help="Concurrent worker count for contact and issue checks (default: 8)",
+        help="Backward-compatible default concurrency for contacts and issue checks",
+    )
+    parser.add_argument(
+        "--contact-workers",
+        type=int,
+        help="Maximum concurrent contact-detail requests (default: --workers)",
+    )
+    parser.add_argument(
+        "--issue-workers",
+        type=int,
+        help="Maximum concurrent issue-history requests (default: --workers)",
     )
     return parser.parse_args(argv)
 

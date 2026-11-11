@@ -132,9 +132,9 @@ API requests; Jira site calls use Jira Basic authentication.
 
 Select one target with `-d` / `--service-desk-id`, `-p` / `--project-key`, or
 `--all-service-desks`. The script resolves each desk's project ID and
-discovers contacts through the paginated
-`GET /rest/servicedesk/1/project/{projectId}/contacts` endpoint. Bulk contacts
-are indexed by account ID, email, and unique normalized display name; unresolved
+reads the first page of `GET /rest/servicedesk/1/project/{projectId}/contacts`,
+caching the index by project ID for reuse across service desks. Contacts are
+indexed by account ID, email, and unique normalized display name; unresolved
 customers fall back to account-ID and email searches. Portal IDs (`qm:`) are
 searched by email rather than by their internal ID. A single email-search
 result may be used when Jira redacts its email or reports a different
@@ -155,6 +155,11 @@ does not bypass the pending-login or customer-role checks. Excluded and
 nonmatching customers are reported as skipped, without contact enrichment. An
 empty input file selects no customers. `-f` / `--exclude-file` (alias
 `--filename`) takes precedence over inclusion in the input file.
+
+`--workers` sets the backward-compatible concurrency default for contact and
+issue checks. `--contact-workers` and `--issue-workers` override these limits
+independently. Worker counts are capped at 32; API metrics are printed at the
+end of a completed run.
 
 Runs remove access by default. Pass `--dry-run` to inspect the console
 decisions and timestamped CSV report without making changes. Reports are

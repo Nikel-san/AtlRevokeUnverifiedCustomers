@@ -86,6 +86,259 @@ class PerformanceOptimizationTests(unittest.TestCase):
         create.assert_called_once_with("example.test", port=None, timeout=30)
         self.assertEqual(connection.request.call_count, 2)
 
+    def test_api_metrics_count_successes_failures_and_safe_categories(self) -> None:
+        app._reset_metrics()
+        responses = []
+        for status, body in (
+            (200, b'{"ok": true}'),
+            (500, b'{"error": true}'),
+            (429, b'{"error": true}'),
+        ):
+            response = mock.Mock(status=status, headers={})
+            response.read.return_value = body
+            responses.append(response)
+        connection = mock.Mock()
+        connection.getresponse.side_effect = responses
+        with (
+            mock.patch.object(app.http.client, "HTTPSConnection", return_value=connection),
+            mock.patch.object(app, "MAX_READ_RETRIES", 0),
+        ):
+            app.request_json(
+                "https://example.test/rest/api/3/search?jql=private%40example.test",
+                api="jira",
+                headers={"Authorization": "secret"},
+            )
+            with self.assertRaisesRegex(app.ApiError, "HTTP 500"):
+                app.request_json(
+                    "https://example.test/rest/servicedesk/1/project/34/contacts",
+                    api="jira",
+                    headers={"Authorization": "secret"},
+                )
+            with self.assertRaisesRegex(app.ApiError, "HTTP 429"):
+                app.request_json(
+                    "https://example.test/rest/servicedesk/1/project/34/contacts",
+                    api="jira",
+                    headers={"Authorization": "secret"},
+                )
+
+        metrics = app._metrics_snapshot()
+        self.assertEqual(metrics["requests"], 3)
+        self.assertEqual(metrics["successful_requests"], 1)
+        self.assertEqual(metrics["failed_requests"], 2)
+        self.assertEqual(metrics["http_429"], 1)
+        self.assertEqual(metrics["http_5xx"], 1)
+        self.assertIn("jira.issue-history", metrics["categories"])
+        self.assertIn("jira.project-contacts.bulk", metrics["categories"])
+        self.assertNotIn("private", repr(metrics))
+        self.assertNotIn("secret", repr(metrics))
+
+    def test_project_contact_index_is_reused_between_service_desks(self) -> None:
+        requests: list[str] = []
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+        contact_cache: dict[tuple[str, str], dict] = {}
+        project_cache: dict[str, tuple[dict[str, dict | None], ...]] = {}
+
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            parsed = urllib.parse.urlsplit(url)
+            requests.append(url)
+            if "/servicedeskapi/servicedesk/" in parsed.path:
+                desk_id = parsed.path.split("/")[-2]
+                account_id = f"qm:{desk_id}"
+                return {
+                    "isLastPage": True,
+                    "values": [
+                        {
+                            "accountId": account_id,
+                            "emailAddress": f"{desk_id}@example.test",
+                        }
+                    ],
+                }
+            if parsed.path.endswith("/contacts"):
+                return {
+                    "contactResults": [
+                        {
+                            "identifier": "qm:12",
+                            "email": "12@example.test",
+                            "loggedInStatus": "PENDING_LOGIN",
+                            "agent": False,
+                        },
+                        {
+                            "identifier": "qm:13",
+                            "email": "13@example.test",
+                            "loggedInStatus": "PENDING_LOGIN",
+                            "agent": False,
+                        },
+                    ]
+                }
+            raise AssertionError(f"unexpected individual lookup: {url}")
+
+        app._reset_metrics()
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            first = app.list_customers(
+                config,
+                "12",
+                project_id="34",
+                contact_cache=contact_cache,
+                project_contact_cache=project_cache,
+            )
+            second = app.list_customers(
+                config,
+                "13",
+                project_id="34",
+                contact_cache=contact_cache,
+                project_contact_cache=project_cache,
+            )
+
+        bulk_requests = [
+            url for url in requests if urllib.parse.urlsplit(url).path.endswith("/contacts")
+        ]
+        self.assertEqual(len(bulk_requests), 1)
+        self.assertEqual([first[0]["accountId"], second[0]["accountId"]], ["qm:12", "qm:13"])
+        self.assertEqual(first[0]["loggedInStatus"], "PENDING_LOGIN")
+        self.assertEqual(second[0]["loggedInStatus"], "PENDING_LOGIN")
+        metrics = app._metrics_snapshot()
+        self.assertEqual(metrics["bulk_contact_lookups"], 1)
+        self.assertEqual(metrics["individual_contact_lookups"], 0)
+        self.assertEqual(metrics["contact_cache_misses"], 2)
+
+    def test_project_contact_indexes_are_separate_by_project(self) -> None:
+        bulk_projects: list[str] = []
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+        project_cache: dict[str, tuple[dict[str, dict | None], ...]] = {}
+
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            parsed = urllib.parse.urlsplit(url)
+            if "/servicedeskapi/servicedesk/" in parsed.path:
+                project_id = parsed.path.split("/")[-2]
+                return {
+                    "isLastPage": True,
+                    "values": [{"accountId": f"qm:{project_id}"}],
+                }
+            project_id = parsed.path.split("/")[-2]
+            bulk_projects.append(project_id)
+            return {
+                "contactResults": [
+                    {
+                        "identifier": f"qm:{project_id}",
+                        "loggedInStatus": "PENDING_LOGIN",
+                        "agent": False,
+                    }
+                ]
+            }
+
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            for project_id in ("project-a", "project-b"):
+                app.list_customers(
+                    config,
+                    project_id,
+                    project_id=project_id,
+                    project_contact_cache=project_cache,
+                )
+
+        self.assertEqual(bulk_projects, ["project-a", "project-b"])
+        self.assertEqual(set(project_cache), {"project-a", "project-b"})
+
+    def test_unresolved_portal_contact_uses_individual_email_lookup(self) -> None:
+        email = "unresolved@example.test"
+        queries: list[str | None] = []
+
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            parsed = urllib.parse.urlsplit(url)
+            if "/servicedeskapi/servicedesk/" in parsed.path:
+                return {
+                    "isLastPage": True,
+                    "values": [{"accountId": "qm:unresolved", "emailAddress": email}],
+                }
+            query = urllib.parse.parse_qs(parsed.query).get("query", [None])[0]
+            queries.append(query)
+            if query is None:
+                return {"contactResults": []}
+            return {
+                "contactResults": [
+                    {
+                        "identifier": "contact-id",
+                        "loggedInStatus": "PENDING_LOGIN",
+                        "agent": False,
+                    }
+                ]
+            }
+
+        app._reset_metrics()
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            customers = app.list_customers(
+                {
+                    "site": "https://example.test",
+                    "jira_email": "user@example.test",
+                    "jira_pat": "not-used",
+                },
+                "12",
+                project_id="34",
+            )
+
+        self.assertEqual(queries, [None, email])
+        self.assertEqual(customers[0]["accountId"], "qm:unresolved")
+        self.assertEqual(customers[0]["contactIdentifier"], "contact-id")
+        metrics = app._metrics_snapshot()
+        self.assertEqual(metrics["bulk_contact_lookups"], 1)
+        self.assertEqual(metrics["individual_contact_lookups"], 1)
+
+    def test_individual_contact_cache_hit_avoids_project_bulk_request(self) -> None:
+        requests: list[str] = []
+
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            requests.append(url)
+            parsed = urllib.parse.urlsplit(url)
+            if "/servicedeskapi/servicedesk/" in parsed.path:
+                return {
+                    "isLastPage": True,
+                    "values": [{"accountId": "qm:cached"}],
+                }
+            if parsed.path.endswith("/contacts"):
+                return {
+                    "contactResults": [
+                        {
+                            "identifier": "qm:cached",
+                            "loggedInStatus": "PENDING_LOGIN",
+                            "agent": False,
+                        }
+                    ]
+                }
+            raise AssertionError(f"unexpected individual lookup: {url}")
+
+        contact_cache: dict[tuple[str, str], dict] = {}
+        project_cache: dict[str, tuple[dict[str, dict | None], ...]] = {}
+        app._reset_metrics()
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            for _ in range(2):
+                app.list_customers(
+                    {
+                        "site": "https://example.test",
+                        "jira_email": "user@example.test",
+                        "jira_pat": "not-used",
+                    },
+                    "12",
+                    project_id="34",
+                    contact_cache=contact_cache,
+                    project_contact_cache=project_cache,
+                )
+
+        self.assertEqual(
+            sum(urllib.parse.urlsplit(url).path.endswith("/contacts") for url in requests),
+            1,
+        )
+        metrics = app._metrics_snapshot()
+        self.assertEqual(metrics["contact_cache_hits"], 1)
+        self.assertEqual(metrics["contact_cache_misses"], 1)
+        self.assertEqual(metrics["bulk_contact_lookups"], 1)
+
     def test_public_customer_pages_are_enriched_with_contact_details(self) -> None:
         page_starts: list[int] = []
         contact_page_starts: list[int] = []
@@ -1077,7 +1330,6 @@ class PerformanceOptimizationTests(unittest.TestCase):
         self.assertEqual(args.org, "org-id")
         self.assertEqual(args.exclude_file, "exclude.csv")
         self.assertTrue(args.dry_run)
-
         customer = {
             "accountId": "qm:dry-run",
             "accountType": "customer",
@@ -1090,8 +1342,65 @@ class PerformanceOptimizationTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(rows[0]["action"], "would remove")
         self.assertFalse(
-            any(call.kwargs.get("method") == "DELETE" for call in request_json.call_args_list)
+            any(
+                call.kwargs.get("method") == "DELETE"
+                for call in request_json.call_args_list
+            )
         )
+
+    def test_independent_worker_limits_and_legacy_default_preserve_eligibility(self) -> None:
+        customer = {
+            "accountId": "qm:worker-test",
+            "accountType": "customer",
+            "agent": False,
+            "contactAgentVerified": True,
+            "loggedInStatus": "PENDING_LOGIN",
+        }
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+        for extra_args, contact_workers, issue_workers in (
+            (
+                ["--workers", "7", "--contact-workers", "2", "--issue-workers", "3"],
+                2,
+                3,
+            ),
+            (["--workers", "4"], 4, 4),
+            (["--workers", "1000"], app.MAX_CONCURRENT_WORKERS, app.MAX_CONCURRENT_WORKERS),
+        ):
+            with self.subTest(extra_args=extra_args):
+                args = app.parse_args(["-d", "12", "--dry-run", *extra_args])
+                rows: list[dict[str, str]] = []
+                with (
+                    mock.patch.object(
+                        app,
+                        "request_json",
+                        return_value={"id": "12", "projectId": "34"},
+                    ),
+                    mock.patch.object(
+                        app, "list_customers", return_value=[customer]
+                    ) as list_customers,
+                    mock.patch.object(
+                        app,
+                        "has_issues_for_accounts",
+                        return_value={"qm:worker-test": False},
+                    ) as issue_check,
+                    mock.patch.object(
+                        app,
+                        "write_report",
+                        side_effect=lambda report_rows, output=None: (
+                            rows.extend(report_rows) or app.Path("report.csv")
+                        ),
+                    ),
+                ):
+                    result = app.process(args, config)
+
+                self.assertEqual(result, 0)
+                self.assertEqual(rows[0]["action"], "would remove")
+                self.assertEqual(list_customers.call_args.kwargs["workers"], contact_workers)
+                self.assertEqual(issue_check.call_args.kwargs["workers"], issue_workers)
 
     def test_delete_failure_is_not_retried(self) -> None:
         response = mock.Mock(status=500)

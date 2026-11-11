@@ -91,6 +91,12 @@ python .\AtlRevokeUnverifiedCustomers.py -d 12
   emails to skip; exclusions take precedence over the input list.
 - `--dry-run`: preview decisions without removing customers. Live execution
   is the default.
+- `--workers N`: backward-compatible concurrency default for contact and
+  issue-history checks (default: 8).
+- `--contact-workers N`: maximum concurrent contact-detail requests; defaults
+  to `--workers`.
+- `--issue-workers N`: maximum concurrent issue-history requests; defaults
+  to `--workers`.
 - `--out PATH`: write the CSV report to this path. Existing files are never
   overwritten. By default, a unique timestamped filename is generated.
 
@@ -99,8 +105,10 @@ python .\AtlRevokeUnverifiedCustomers.py -d 12
 The script prints each customer’s email, display name, account ID, account
 type, service desk, status, action, and reason, followed by a summary of desks
 processed, customers scanned, candidates, would-remove/removed totals, skips,
-and errors. `WARN`, `SUCCESS`, and `ERROR` labels and action statuses use color
-in interactive terminals and respect `NO_COLOR`.
+and errors. It also prints request counts by endpoint category, HTTP failures,
+contact-cache statistics, lookup counts, and elapsed time. `WARN`, `SUCCESS`,
+and `ERROR` labels and action statuses use color in interactive terminals and
+respect `NO_COLOR`.
 
 The CSV report contains these columns:
 
@@ -120,15 +128,14 @@ desk(s) only. It never deletes or deactivates Atlassian accounts.
 
 Customers are enumerated with the paginated
 `GET /rest/servicedeskapi/servicedesk/{serviceDeskId}/customer` endpoint.
-The script reads the first page of the project contacts endpoint and indexes
-the contacts returned there by account ID, email, and unique normalized display
-name. This partial bulk lookup resolves matching customers without one search
-request per account. Unresolved customers fall back to individual searches by
-account ID and email; portal IDs (`qm:`) are searched by email, not by their
-internal ID. A single result from an email search is accepted even when Jira
-redacts its email or returns a different identifier. Ambiguous display-name
-matches are not used. If bulk discovery is unavailable, the script warns and
-uses the per-account fallback.
+The script reads the first page of the project contacts endpoint and caches its
+index by project ID for reuse across service desks. Contacts are indexed by
+account ID, email, and unique normalized display name. Unresolved customers
+fall back to individual searches by account ID and email; portal IDs (`qm:`)
+are searched by email, not by their internal ID. A single result from an email
+search is accepted even when Jira redacts its email or returns a different
+identifier. Ambiguous display-name matches are not used. If bulk discovery is
+unavailable, the script warns and uses the per-account fallback.
 
 Removal requires both `loggedInStatus: "PENDING_LOGIN"` and `agent: false`.
 `--input-file` narrows the contacts processed but cannot override those safety
