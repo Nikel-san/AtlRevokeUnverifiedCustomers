@@ -786,6 +786,115 @@ class PerformanceOptimizationTests(unittest.TestCase):
         self.assertEqual(contacts[0]["loggedInStatus"], "PENDING_LOGIN")
         self.assertFalse(contacts[0]["agent"])
 
+    def test_portal_customer_falls_back_to_display_name_when_email_misses(self) -> None:
+        account_id = "qm:portal-customer"
+        email = "customer@example.test"
+        display_name = "Portal Customer"
+        queries: list[str] = []
+
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            parsed_url = urllib.parse.urlsplit(url)
+            if "/rest/servicedeskapi/servicedesk/12/customer" in parsed_url.path:
+                return {
+                    "isLastPage": True,
+                    "values": [
+                        {
+                            "accountId": account_id,
+                            "emailAddress": email,
+                            "displayName": display_name,
+                        }
+                    ],
+                }
+
+            params = urllib.parse.parse_qs(parsed_url.query)
+            query = params.get("query", [None])[0]
+            if query is None:
+                return {"contactResults": []}
+            queries.append(query)
+            if query == email:
+                return {"contactResults": []}
+            self.assertEqual(query, display_name)
+            return {
+                "contactResults": [
+                    {
+                        "identifier": "contact-side-id",
+                        "email": "redacted@example.test",
+                        "displayName": display_name,
+                        "loggedInStatus": "LOGGED_IN",
+                        "agent": False,
+                    }
+                ]
+            }
+
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            customers = app.list_customers(config, "12", project_id="34")
+
+        self.assertEqual(queries, [email, display_name])
+        self.assertEqual(len(customers), 1)
+        self.assertEqual(customers[0]["accountId"], account_id)
+        self.assertEqual(customers[0]["contactIdentifier"], "contact-side-id")
+        self.assertEqual(customers[0]["loggedInStatus"], "LOGGED_IN")
+        self.assertIs(customers[0]["agent"], False)
+        self.assertTrue(customers[0]["contactAgentVerified"])
+
+    def test_ambiguous_display_name_lookup_stays_unverified(self) -> None:
+        account_id = "qm:ambiguous"
+        email = "ambiguous@example.test"
+        display_name = "Shared Name"
+
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            parsed_url = urllib.parse.urlsplit(url)
+            if "/rest/servicedeskapi/servicedesk/12/customer" in parsed_url.path:
+                return {
+                    "isLastPage": True,
+                    "values": [
+                        {
+                            "accountId": account_id,
+                            "emailAddress": email,
+                            "displayName": display_name,
+                        }
+                    ],
+                }
+            query = urllib.parse.parse_qs(parsed_url.query).get("query", [None])[0]
+            if query is None or query == email:
+                return {"contactResults": []}
+            return {
+                "contactResults": [
+                    {
+                        "identifier": "contact-1",
+                        "displayName": display_name,
+                        "loggedInStatus": "PENDING_LOGIN",
+                        "agent": False,
+                    },
+                    {
+                        "identifier": "contact-2",
+                        "displayName": display_name,
+                        "loggedInStatus": "PENDING_LOGIN",
+                        "agent": False,
+                    },
+                ]
+            }
+
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            customers = app.list_customers(
+                {
+                    "site": "https://example.test",
+                    "jira_email": "user@example.test",
+                    "jira_pat": "not-used",
+                },
+                "12",
+                project_id="34",
+            )
+
+        self.assertEqual(customers[0]["loggedInStatus"], "UNKNOWN")
+        self.assertIsNone(customers[0]["agent"])
+        self.assertFalse(customers[0]["contactAgentVerified"])
+
     def test_transient_contact_query_failure_does_not_abort_customer_processing(self) -> None:
         unresolved_email = "unavailable@example.test"
         resolved_email = "available@example.test"

@@ -904,7 +904,10 @@ def list_customers(
                         break
 
         def find_contact_by_query(
-            query: str, *, is_email_query: bool
+            query: str,
+            *,
+            is_email_query: bool,
+            is_display_name_query: bool = False,
         ) -> dict[str, Any] | None:
             contact_query = urllib.parse.urlencode({"query": query})
             contact_url = (
@@ -931,13 +934,24 @@ def list_customers(
                 email if is_email_query else "",
                 display_name,
                 accept_single_email_result=is_email_query,
-                match_display_name=is_email_query,
+                match_display_name=is_display_name_query,
             )
 
         if contact is None and not is_portal_customer_id(account_id):
             contact = find_contact_by_query(account_id, is_email_query=False)
         if contact is None and email:
             contact = find_contact_by_query(email, is_email_query=True)
+        if (
+            contact is None
+            and display_name
+            and _normalized_contact_key(display_name)
+            != _normalized_contact_key(email)
+        ):
+            contact = find_contact_by_query(
+                display_name,
+                is_email_query=False,
+                is_display_name_query=True,
+            )
 
         if contact is None:
             fallback_contact = {
