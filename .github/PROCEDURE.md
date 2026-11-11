@@ -123,9 +123,10 @@ Command-line values take precedence:
 Jira site, email, and PAT settings are always required. The Organization API
 token and organization ID are required only when a non-portal Atlassian account
 needs organization-level validation. Organization credentials are not queried
-for `qm:` portal accounts. Missing required settings cause a clear error and
-exit code 2. The Organization API token is used only for Organization API
-requests; Jira site calls use Jira Basic authentication.
+for `qm:` portal accounts. If credentials are missing when organization
+validation is needed, the affected account is skipped as unverifiable and
+processing continues. The Organization API token is used only for Organization
+API requests; Jira site calls use Jira Basic authentication.
 
 ## Selection and review
 
@@ -150,9 +151,10 @@ bypass JQL and are treated as having no issues. No account deletion or global
 deactivation logic is used.
 
 An optional `--input-file` limits processing to listed account IDs/emails; it
-does not bypass the pending-login or customer-role checks. `-f` /
-`--exclude-file` (alias `--filename`) is a CSV allow list and takes precedence
-over inclusion in the input file.
+does not bypass the pending-login or customer-role checks. Excluded and
+nonmatching customers are reported as skipped, without contact enrichment. An
+empty input file selects no customers. `-f` / `--exclude-file` (alias
+`--filename`) takes precedence over inclusion in the input file.
 
 Runs remove access by default. Pass `--dry-run` to inspect the console
 decisions and timestamped CSV report without making changes. Reports are

@@ -676,84 +676,13 @@ def _list_project_contacts(
     project_id: str,
     headers: dict[str, str],
 ) -> list[dict[str, Any]]:
-    contacts: list[dict[str, Any]] = []
-    seen_contacts: set[tuple[str, ...]] = set()
-    seen_pages: set[tuple[tuple[str, ...], ...]] = set()
-    start = 0
-    while True:
-        page_query = urllib.parse.urlencode(
-            {"start": start, "limit": PROJECT_CONTACT_PAGE_SIZE}
-        )
-        page_url = (
-            f"{config['site']}/rest/servicedesk/1/project/"
-            f"{urllib.parse.quote(project_id, safe='')}/contacts?{page_query}"
-        )
-        response = request_json(page_url, api="jira", headers=headers)
-        page_values, metadata = _parse_contact_page(response)
-        if not all(isinstance(item, dict) for item in page_values):
-            raise ApiError("jira", "project contact response contained an invalid item")
-
-        page_contacts = [item for item in page_values if isinstance(item, dict)]
-        page_signature = tuple(
-            sorted(_contact_identity(item) for item in page_contacts)
-        )
-        if page_signature in seen_pages and page_contacts:
-            raise ApiError(
-                "jira",
-                f"project contact pagination repeated a page at start={start}",
-            )
-        seen_pages.add(page_signature)
-
-        new_contacts = 0
-        for contact in page_contacts:
-            identity = _contact_identity(contact)
-            if identity not in seen_contacts:
-                seen_contacts.add(identity)
-                contacts.append(contact)
-                new_contacts += 1
-
-        is_last_page = metadata.get("isLastPage")
-        if not isinstance(is_last_page, bool):
-            has_next_page = metadata.get("hasNextPage", metadata.get("hasMore"))
-            if isinstance(has_next_page, bool):
-                is_last_page = not has_next_page
-            else:
-                total = next(
-                    (
-                        metadata.get(name)
-                        for name in ("total", "totalCount", "totalSize")
-                        if isinstance(metadata.get(name), int)
-                        and not isinstance(metadata.get(name), bool)
-                    ),
-                    None,
-                )
-                page_start = metadata.get("start", metadata.get("offset", start))
-                if (
-                    total is not None
-                    and isinstance(page_start, int)
-                    and not isinstance(page_start, bool)
-                ):
-                    is_last_page = page_start + len(page_contacts) >= total
-        if is_last_page is True:
-            break
-        if not page_contacts:
-            if is_last_page is False:
-                raise ApiError(
-                    "jira",
-                    (
-                        f"project contact page at start={start} was empty "
-                        "but marked as not last"
-                    ),
-                )
-            break
-        if new_contacts == 0:
-            raise ApiError(
-                "jira",
-                f"project contact pagination repeated contacts at start={start}",
-            )
-        start += len(page_contacts)
-
-    return contacts
+    page_url = (
+        f"{config['site']}/rest/servicedesk/1/project/"
+        f"{urllib.parse.quote(project_id, safe='')}/contacts"
+    )
+    response = request_json(page_url, api="jira", headers=headers)
+    page_values, _ = _parse_contact_page(response)
+    return [item for item in page_values if isinstance(item, dict)]
 
 
 def list_customers(
@@ -762,6 +691,7 @@ def list_customers(
     project_id: str | None = None,
     *,
     input_ids: set[str] | None = None,
+    input_filter_enabled: bool = False,
     exclude_ids: set[str] | None = None,
     contact_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
     workers: int = CONTACT_PAGE_WORKERS,
@@ -774,6 +704,9 @@ def list_customers(
     is_tty = sys.stderr.isatty()
     customers: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
+    seen_pages: set[tuple[str, ...]] = set()
+    normalized_input_ids = {item.casefold() for item in input_ids or set()}
+    normalized_exclude_ids = {item.casefold() for item in exclude_ids or set()}
     start = 0
     while True:
         page_query = urllib.parse.urlencode(
@@ -804,7 +737,30 @@ def list_customers(
                 "jira", "service-desk customer response contained an invalid item"
             )
 
-        new_items = 0
+        is_last_page = response.get("isLastPage")
+        page_signature = tuple(
+            sorted(
+                account_id
+                for account_id in (
+                    str(
+                        item.get("accountId") or item.get("identifier") or ""
+                    )
+                    for item in page_values
+                )
+                if account_id
+            )
+        )
+        page_can_repeat = is_last_page is False or (
+            is_last_page is not True and len(page_values) >= CONTACT_PAGE_SIZE
+        )
+        if page_signature and page_can_repeat and page_signature in seen_pages:
+            raise ApiError(
+                "jira",
+                f"service-desk customer pagination repeated a page at start={start}",
+            )
+        if page_signature:
+            seen_pages.add(page_signature)
+
         for customer in page_values:
             account_id = str(
                 customer.get("accountId") or customer.get("identifier") or ""
@@ -822,10 +778,14 @@ def list_customers(
                 )
                 if key
             }
-            if exclude_ids and match_keys & exclude_ids:
-                continue
-            if input_ids and not (match_keys & input_ids):
-                continue
+            filter_reason = (
+                "excluded by file"
+                if match_keys & normalized_exclude_ids
+                else "not in input file"
+                if input_filter_enabled
+                and not (match_keys & normalized_input_ids)
+                else ""
+            )
             canonical_account_id = str(
                 customer.get("accountId") or customer.get("identifier") or ""
             )
@@ -834,9 +794,9 @@ def list_customers(
                     **customer,
                     "accountId": canonical_account_id,
                     "customerAccountId": canonical_account_id,
+                    "_filter_reason": filter_reason,
                 }
             )
-            new_items += 1
 
         if is_tty:
             sys.stderr.write(f"\rScanning customers: {len(customers)} fetched...")
@@ -844,7 +804,6 @@ def list_customers(
         elif len(customers) and len(customers) % 500 == 0:
             sys.stderr.write(f"Scanning customers: {len(customers)} fetched.\n")
 
-        is_last_page = response.get("isLastPage")
         if is_last_page is True:
             break
         if not page_values:
@@ -857,11 +816,6 @@ def list_customers(
             break
         if is_last_page is not False and len(page_values) < CONTACT_PAGE_SIZE:
             break
-        if new_items == 0:
-            raise ApiError(
-                "jira",
-                f"service-desk customer pagination repeated a page at start={start}",
-            )
         start += len(page_values)
 
     if is_tty:
@@ -869,6 +823,11 @@ def list_customers(
         sys.stderr.flush()
 
     contact_cache = contact_cache if contact_cache is not None else {}
+    customers_to_enrich = [
+        customer for customer in customers if not customer.get("_filter_reason")
+    ]
+    if not customers_to_enrich:
+        return customers
     bulk_contact_error = False
     try:
         project_contacts = _list_project_contacts(
@@ -883,7 +842,7 @@ def list_customers(
         )
         project_contacts = []
         bulk_contact_error = True
-    if customers and not project_contacts and not bulk_contact_error:
+    if customers_to_enrich and not project_contacts and not bulk_contact_error:
         warn(
             "Bulk contact discovery returned no contacts; "
             "falling back to contact searches."
@@ -965,15 +924,20 @@ def list_customers(
 
     contacts: list[dict[str, Any]] = []
     worker_count = max(1, int(workers or CONTACT_PAGE_WORKERS))
+    enriched_by_id: dict[str, dict[str, Any]] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
         chunk_size = max(1, worker_count * 4)
-        for offset in range(0, len(customers), chunk_size):
-            batch = customers[offset : offset + chunk_size]
+        for offset in range(0, len(customers_to_enrich), chunk_size):
+            batch = customers_to_enrich[offset : offset + chunk_size]
             for contact in executor.map(fetch_contact_details, batch):
                 contacts.append(contact)
+                customer_id = str(
+                    contact.get("accountId") or contact.get("customerAccountId") or ""
+                ).casefold()
+                enriched_by_id[customer_id] = contact
                 if is_tty:
                     sys.stderr.write(
-                        f"\rResolving contact details: {len(contacts)}/{len(customers)}..."
+                        f"\rResolving contact details: {len(contacts)}/{len(customers_to_enrich)}..."
                     )
                     sys.stderr.flush()
                 elif len(contacts) % 500 == 0:
@@ -983,7 +947,15 @@ def list_customers(
     if is_tty and customers:
         sys.stderr.write("\n")
         sys.stderr.flush()
-    return contacts
+    return [
+        customer
+        if customer.get("_filter_reason")
+        else enriched_by_id.get(
+            str(customer.get("accountId") or customer.get("identifier") or "").casefold(),
+            customer,
+        )
+        for customer in customers
+    ]
 
 
 def jira_user_profile(
@@ -1260,6 +1232,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                 else None
             ),
             input_ids=input_ids,
+            input_filter_enabled=input_mode,
             exclude_ids=excluded_ids,
             contact_cache=contact_cache,
             workers=args.workers,
@@ -1291,12 +1264,15 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                 error_count += 1
                 rows.append(row)
                 continue
-            if match_keys & excluded_ids:
-                row["reason"] = "present in exclude list"
-                rows.append(row)
-                continue
-            if input_mode and not (match_keys & input_ids):
-                row["reason"] = "not present in input list"
+            filter_reason = customer.get("_filter_reason") or (
+                "excluded by file"
+                if match_keys & excluded_ids
+                else "not in input file"
+                if input_mode and not (match_keys & input_ids)
+                else ""
+            )
+            if filter_reason:
+                row["reason"] = str(filter_reason)
                 rows.append(row)
                 continue
 
@@ -1354,11 +1330,12 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                 org_user = None
                 if profile_type == "atlassian":
                     if not config.get("org") or not config.get("token"):
-                        raise ValueError(
-                            "Organization API credentials are required to validate "
-                            "non-customer Atlassian accounts; provide --token and --org "
-                            "or ATLASSIAN_TOKEN and ATLASSIAN_ORG."
+                        row["reason"] = (
+                            "Organization validation unavailable: credentials "
+                            "are missing"
                         )
+                        rows.append(row)
+                        continue
                     if org_users is None:
                         org_users = load_org_users(config)
                     org_user = org_users.get(account_id.casefold())

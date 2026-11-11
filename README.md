@@ -120,20 +120,22 @@ desk(s) only. It never deletes or deactivates Atlassian accounts.
 
 Customers are enumerated with the paginated
 `GET /rest/servicedeskapi/servicedesk/{serviceDeskId}/customer` endpoint.
-The script first reads the project contacts endpoint in pages of 100 and
-indexes contacts by account ID, email, and unique normalized display name.
-This bulk lookup resolves each customer's `loggedInStatus` and `agent` without
-one search request per account. If a customer is not matched, it falls back to
-searches by account ID and email; portal IDs (`qm:`) are searched by email,
-not by their internal ID. A single result from an email search is accepted
-even when Jira redacts its email or returns a different identifier. Ambiguous
-display-name matches are not used. If bulk discovery is unavailable, the script
-warns and uses the per-account fallback.
+The script reads the first page of the project contacts endpoint and indexes
+the contacts returned there by account ID, email, and unique normalized display
+name. This partial bulk lookup resolves matching customers without one search
+request per account. Unresolved customers fall back to individual searches by
+account ID and email; portal IDs (`qm:`) are searched by email, not by their
+internal ID. A single result from an email search is accepted even when Jira
+redacts its email or returns a different identifier. Ambiguous display-name
+matches are not used. If bulk discovery is unavailable, the script warns and
+uses the per-account fallback.
 
 Removal requires both `loggedInStatus: "PENDING_LOGIN"` and `agent: false`.
 `--input-file` narrows the contacts processed but cannot override those safety
-checks. `LOGGED_IN`, missing/unknown statuses, agents, and contacts whose agent
-status is not explicitly `false` are skipped.
+checks. Excluded and nonmatching customers remain in the report as skipped, and
+filtered customers are not contact-enriched. An empty input file matches no
+customers. `LOGGED_IN`, missing/unknown statuses, agents, and contacts whose
+agent status is not explicitly `false` are skipped.
 
 Every eligible candidate is checked for issue history with
 `reporter = "{accountId}" OR creator = "{accountId}"` and `maxResults=1`.
@@ -142,6 +144,9 @@ issues; authorization failures terminate with exit code 2. If issue verification
 is unavailable for any other reason, the customer is skipped and reported as
 unverifiable. Non-portal Atlassian accounts must also pass the Jira
 application-role, administrator-group, and organization-directory checks.
+Organization credentials are optional for portal-only processing; when
+organization validation is required but its credentials are missing, that
+account is skipped and processing continues.
 
 Transient read-only GET failures (HTTP 429 and common 5xx responses) are
 retried with bounded backoff. HTTPS connections are reused, and fallback

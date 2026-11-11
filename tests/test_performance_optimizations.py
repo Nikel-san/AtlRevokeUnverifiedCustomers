@@ -1,4 +1,5 @@
 import threading
+import tempfile
 import unittest
 import urllib.parse
 from unittest import mock
@@ -114,10 +115,10 @@ class PerformanceOptimizationTests(unittest.TestCase):
             self.assertEqual(
                 parsed_url.path, "/rest/servicedesk/1/project/34/contacts"
             )
-            start = int(params["start"][0])
+            start = int(params.get("start", ["0"])[0])
             with lock:
                 contact_page_starts.append(start)
-            end = min(start + app.PROJECT_CONTACT_PAGE_SIZE, 103)
+            end = 103
             return {
                 "contactResults": [
                     {
@@ -142,7 +143,7 @@ class PerformanceOptimizationTests(unittest.TestCase):
             contacts = app.list_customers(config, "12", project_id="34")
 
         self.assertEqual(page_starts, [0, 50, 100])
-        self.assertEqual(contact_page_starts, [0, 100])
+        self.assertEqual(contact_page_starts, [0])
         self.assertEqual(len(contacts), 103)
         self.assertTrue(all(contact["agent"] is False for contact in contacts))
         self.assertTrue(
@@ -167,7 +168,145 @@ class PerformanceOptimizationTests(unittest.TestCase):
             with self.assertRaisesRegex(app.ApiError, "pagination repeated a page"):
                 app.list_customers(config, "12", project_id="34")
 
-    def test_repeated_project_contact_page_fails(self) -> None:
+    def test_empty_input_file_filters_every_customer_without_contact_enrichment(self) -> None:
+        page_starts: list[int] = []
+        contact_requests: list[str] = []
+
+        def fake_request(
+            url: str,
+            *,
+            api: str,
+            headers: dict[str, str],
+            method: str = "GET",
+            body: dict | None = None,
+        ) -> dict:
+            parsed_url = urllib.parse.urlsplit(url)
+            if parsed_url.path == "/rest/servicedeskapi/servicedesk/12":
+                return {"id": "12", "projectId": "34", "projectName": "HELP"}
+            if "/rest/servicedeskapi/servicedesk/12/customer" in parsed_url.path:
+                start = int(urllib.parse.parse_qs(parsed_url.query)["start"][0])
+                page_starts.append(start)
+                end = min(start + 50, 51)
+                return {
+                    "isLastPage": end == 51,
+                    "values": [
+                        {
+                            "accountId": f"qm:customer-{index}",
+                            "emailAddress": f"user-{index}@example.test",
+                        }
+                        for index in range(start, end)
+                    ],
+                }
+            contact_requests.append(url)
+            raise AssertionError("filtered customers must not trigger contact lookups")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = app.Path(temp_dir) / "empty.txt"
+            input_path.write_text("", encoding="utf-8")
+            args = app.parse_args(
+                ["-d", "12", "--input-file", str(input_path), "--dry-run"]
+            )
+            report_rows: list[dict[str, str]] = []
+            with (
+                mock.patch.object(app, "request_json", side_effect=fake_request),
+                mock.patch.object(
+                    app,
+                    "write_report",
+                    side_effect=lambda rows, output=None: (
+                        report_rows.extend(rows) or app.Path("report.csv")
+                    ),
+                ),
+            ):
+                result = app.process(
+                    args,
+                    {
+                        "site": "https://example.test",
+                        "jira_email": "user@example.test",
+                        "jira_pat": "not-used",
+                    },
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(page_starts, [0, 50])
+        self.assertEqual(len(report_rows), 51)
+        self.assertTrue(
+            all(row["reason"] == "not in input file" for row in report_rows)
+        )
+        self.assertEqual(contact_requests, [])
+
+    def test_excluded_and_nonmatching_customers_are_reported_without_missing_target(self) -> None:
+        def fake_request(
+            url: str,
+            *,
+            api: str,
+            headers: dict[str, str],
+            method: str = "GET",
+            body: dict | None = None,
+        ) -> dict:
+            parsed_url = urllib.parse.urlsplit(url)
+            if parsed_url.path == "/rest/servicedeskapi/servicedesk/12":
+                return {"id": "12", "projectId": "34", "projectName": "HELP"}
+            if "/rest/servicedeskapi/servicedesk/12/customer" in parsed_url.path:
+                return {
+                    "isLastPage": True,
+                    "values": [
+                        {
+                            "accountId": "qm:excluded",
+                            "emailAddress": "excluded@example.test",
+                        },
+                        {
+                            "accountId": "qm:other",
+                            "emailAddress": "other@example.test",
+                        },
+                    ],
+                }
+            raise AssertionError("filtered customers must not trigger contact lookups")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = app.Path(temp_dir) / "input.txt"
+            exclude_path = app.Path(temp_dir) / "exclude.txt"
+            input_path.write_text("qm:excluded\n", encoding="utf-8")
+            exclude_path.write_text("qm:excluded\n", encoding="utf-8")
+            args = app.parse_args(
+                [
+                    "-d",
+                    "12",
+                    "--input-file",
+                    str(input_path),
+                    "--exclude-file",
+                    str(exclude_path),
+                    "--dry-run",
+                ]
+            )
+            report_rows: list[dict[str, str]] = []
+            with (
+                mock.patch.object(app, "request_json", side_effect=fake_request),
+                mock.patch.object(
+                    app,
+                    "write_report",
+                    side_effect=lambda rows, output=None: (
+                        report_rows.extend(rows) or app.Path("report.csv")
+                    ),
+                ),
+                mock.patch.object(app, "log_error") as log_error,
+            ):
+                result = app.process(
+                    args,
+                    {
+                        "site": "https://example.test",
+                        "jira_email": "user@example.test",
+                        "jira_pat": "not-used",
+                    },
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [row["reason"] for row in report_rows],
+            ["excluded by file", "not in input file"],
+        )
+        log_error.assert_not_called()
+
+    def test_project_contacts_keep_first_page_when_endpoint_has_more_pages(self) -> None:
         contact = {
             "identifier": "account-1",
             "loggedInStatus": "PENDING_LOGIN",
@@ -179,9 +318,11 @@ class PerformanceOptimizationTests(unittest.TestCase):
             app,
             "request_json",
             return_value={"contactResults": [contact], "isLastPage": False},
-        ):
-            with self.assertRaisesRegex(app.ApiError, "pagination repeated a page"):
-                app._list_project_contacts(config, "34", {})
+        ) as request_json:
+            contacts = app._list_project_contacts(config, "34", {})
+        self.assertEqual(contacts, [contact])
+        request_json.assert_called_once()
+        self.assertNotIn("start=", request_json.call_args.args[0])
 
     def test_portal_customer_without_contact_record_is_not_assumed_pending_login(self) -> None:
         def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
@@ -808,39 +949,51 @@ class PerformanceOptimizationTests(unittest.TestCase):
             workers=app.CONTACT_PAGE_WORKERS,
         )
 
-    def test_missing_org_credentials_fail_closed_for_atlassian_account(self) -> None:
-        customer = {
-            "accountId": "standard-account",
-            "agent": False,
-            "contactAgentVerified": True,
-            "loggedInStatus": "PENDING_LOGIN",
-        }
+    def test_missing_org_credentials_skip_account_and_continue(self) -> None:
+        customers = [
+            {
+                "accountId": "standard-account",
+                "agent": False,
+                "contactAgentVerified": True,
+                "loggedInStatus": "PENDING_LOGIN",
+            },
+            {
+                "accountId": "qm:portal",
+                "accountType": "customer",
+                "agent": False,
+                "contactAgentVerified": True,
+                "loggedInStatus": "PENDING_LOGIN",
+            },
+        ]
         profile = {
             "accountType": "atlassian",
             "applicationRoles": {"size": 0, "items": []},
             "groups": {"size": 0, "items": []},
         }
-        args = app.parse_args(["-d", "12", "--dry-run"])
         config = {
             "site": "https://example.test",
             "jira_email": "user@example.test",
             "jira_pat": "not-used",
         }
-        with (
-            mock.patch.object(
-                app,
-                "request_json",
-                return_value={"id": "12", "projectId": "34"},
-            ),
-            mock.patch.object(app, "list_customers", return_value=[customer]),
-            mock.patch.object(app, "jira_user_profile", return_value=profile),
-            mock.patch.object(app, "load_org_users") as org_loader,
-        ):
-            with self.assertRaisesRegex(
-                ValueError, "Organization API credentials are required"
-            ):
-                app.process(args, config)
+        result, rows, _, issue_check, org_loader = self.run_process_with_customers(
+            customers,
+            {"qm:portal": False},
+            config=config,
+            profile=profile,
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [(row["account_id"], row["action"]) for row in rows],
+            [
+                ("standard-account", "skipped"),
+                ("qm:portal", "would remove"),
+            ],
+        )
+        self.assertIn("credentials are missing", rows[0]["reason"])
         org_loader.assert_not_called()
+        issue_check.assert_called_once_with(
+            config, ["qm:portal"], workers=app.CONTACT_PAGE_WORKERS
+        )
 
     def test_resolve_config_requires_jira_but_not_organization_credentials(self) -> None:
         args = app.parse_args(
@@ -864,6 +1017,41 @@ class PerformanceOptimizationTests(unittest.TestCase):
         self.assertEqual(config["site"], "https://example.test")
         self.assertEqual(config["token"], "")
         self.assertEqual(config["org"], "")
+
+    def test_resolve_config_preserves_cli_precedence_over_environment(self) -> None:
+        args = app.parse_args(
+            [
+                "-d",
+                "12",
+                "--site",
+                "cli.example.test",
+                "--jira-email",
+                "cli@example.test",
+                "--jira-pat",
+                "cli-jira-token",
+                "--token",
+                "cli-org-token",
+                "--org",
+                "cli-org",
+            ]
+        )
+        with mock.patch.dict(
+            app.os.environ,
+            {
+                "ATLASSIAN_SITE": "env.example.test",
+                "JIRA_EMAIL": "env@example.test",
+                "JIRA_PAT": "env-jira-token",
+                "ATLASSIAN_TOKEN": "env-org-token",
+                "ATLASSIAN_ORG": "env-org",
+            },
+            clear=False,
+        ):
+            config = app.resolve_config(args)
+        self.assertEqual(config["site"], "https://cli.example.test")
+        self.assertEqual(config["jira_email"], "cli@example.test")
+        self.assertEqual(config["jira_pat"], "cli-jira-token")
+        self.assertEqual(config["token"], "cli-org-token")
+        self.assertEqual(config["org"], "cli-org")
 
     def test_cli_aliases_and_dry_run_do_not_issue_deletes(self) -> None:
         args = app.parse_args(
