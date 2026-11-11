@@ -14,18 +14,22 @@ changing service-desk access.
 ## Requirements
 
 - Python 3.10 or later; no additional Python packages are required.
-- An Atlassian Organization API key and organization ID.
 - A Jira API token and Jira account email.
-- Permission to read the organization directory and all Jira projects whose
-  issues should count as customer activity.
+- An Atlassian Organization API key and organization ID when a non-portal
+  Atlassian account requires organization-level validation.
+- Permission to search issues in relevant Jira projects.
+- Organization directory permission when validating non-portal Atlassian
+  accounts.
 - Permission to list service desks and remove customers from selected desks
   when running live.
 
 ## Environment variables
 
-All five variables are required. Corresponding command-line options override
-environment values. The organization bearer token is used only with the
-Organization API; Jira site requests use Jira Basic authentication.
+Jira settings are required. Organization settings are optional unless a
+non-portal Atlassian account requires organization-level validation.
+Corresponding command-line options override environment values. The
+organization bearer token is used only with the Organization API; Jira site
+requests use Jira Basic authentication.
 
 | Variable | Command-line option | Purpose |
 | --- | --- | --- |
@@ -130,6 +134,14 @@ Removal requires both `loggedInStatus: "PENDING_LOGIN"` and `agent: false`.
 `--input-file` narrows the contacts processed but cannot override those safety
 checks. `LOGGED_IN`, missing/unknown statuses, agents, and contacts whose agent
 status is not explicitly `false` are skipped.
+
+Every eligible candidate is checked for issue history with
+`reporter = "{accountId}" OR creator = "{accountId}"` and `maxResults=1`.
+Portal IDs (`qm:`) bypass JQL as specified. HTTP 400 is treated as no matching
+issues; authorization failures terminate with exit code 2. If issue verification
+is unavailable for any other reason, the customer is skipped and reported as
+unverifiable. Non-portal Atlassian accounts must also pass the Jira
+application-role, administrator-group, and organization-directory checks.
 
 Transient read-only GET failures (HTTP 429 and common 5xx responses) are
 retried with bounded backoff. HTTPS connections are reused, and fallback

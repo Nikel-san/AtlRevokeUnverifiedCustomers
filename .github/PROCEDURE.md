@@ -108,8 +108,9 @@ Atlassian accounts are never deleted or deactivated.
 
 ## Configuration
 
-Set all five required settings through the operating system environment or
-command-line options. Command-line values take precedence:
+Set the required Jira settings and, when needed, the optional Organization API
+settings through the operating system environment or command-line options.
+Command-line values take precedence:
 
 | Command-line option | Environment variable | Purpose |
 | --- | --- | --- |
@@ -119,9 +120,12 @@ command-line options. Command-line values take precedence:
 | `--jira-email` | `JIRA_EMAIL` | Jira account email |
 | `--jira-pat` | `JIRA_PAT` | Jira API token |
 
-The Organization API token is used only for Organization API requests. Jira
-site API calls use Jira Basic authentication. Missing or malformed settings
-cause a clear error and exit code 2.
+Jira site, email, and PAT settings are always required. The Organization API
+token and organization ID are required only when a non-portal Atlassian account
+needs organization-level validation. Organization credentials are not queried
+for `qm:` portal accounts. Missing required settings cause a clear error and
+exit code 2. The Organization API token is used only for Organization API
+requests; Jira site calls use Jira Basic authentication.
 
 ## Selection and review
 
@@ -138,8 +142,12 @@ discovery is unavailable, the script warns before using per-account searches.
 
 Removal eligibility requires both `loggedInStatus: "PENDING_LOGIN"` and
 `agent: false`. `LOGGED_IN`, unknown/missing statuses, agents, and contacts
-without an explicit `agent: false` are skipped. No ticket-history, account
-deletion, or global deactivation logic is used.
+without an explicit `agent: false` are skipped. Non-portal candidates also
+require an issue-history check (`reporter = "{accountId}" OR creator =
+"{accountId}"`, `maxResults=1`). HTTP 400 means no matching issues; issue
+verification failures and authorization errors fail closed. `qm:` accounts
+bypass JQL and are treated as having no issues. No account deletion or global
+deactivation logic is used.
 
 An optional `--input-file` limits processing to listed account IDs/emails; it
 does not bypass the pending-login or customer-role checks. `-f` /

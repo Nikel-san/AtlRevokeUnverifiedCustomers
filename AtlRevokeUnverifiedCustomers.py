@@ -352,11 +352,13 @@ def resolve_config(args: argparse.Namespace) -> dict[str, str]:
         key: (value if value is not None else os.getenv(env_name, "")).strip()
         for key, (value, env_name) in sources.items()
     }
-    missing = [key for key, value in config.items() if not value.strip()]
+    missing = [
+        key
+        for key in ("site", "jira_email", "jira_pat")
+        if not config[key].strip()
+    ]
     if missing:
         option_names = {
-            "token": "--token",
-            "org": "-o/--org",
             "site": "-s/--site",
             "jira_email": "--jira-email",
             "jira_pat": "--jira-pat",
@@ -807,10 +809,11 @@ def list_customers(
             account_id = str(
                 customer.get("accountId") or customer.get("identifier") or ""
             )
-            if account_id and account_id in seen_ids:
+            account_key = account_id.casefold()
+            if account_key and account_key in seen_ids:
                 continue
-            if account_id:
-                seen_ids.add(account_id)
+            if account_key:
+                seen_ids.add(account_key)
             match_keys = {
                 key.casefold()
                 for key in (
@@ -887,7 +890,7 @@ def list_customers(
         key = (str(resolved_project_id), account_id)
         if contact_cache is not None and key in contact_cache:
             cached = contact_cache[key]
-            return {**customer, **cached}
+            return _merge_customer_contact(customer, cached)
 
         email = str(customer.get("emailAddress") or customer.get("email") or "")
         display_name = str(customer.get("displayName") or "")
@@ -940,18 +943,16 @@ def list_customers(
 
         if contact is None:
             fallback_contact = {
-                "accountId": account_id,
-                "identifier": account_id,
                 "accountType": "customer"
                 if is_customer_contact
                 else (customer.get("accountType") or "unknown"),
                 "loggedInStatus": "UNKNOWN",
-                "agent": False if is_customer_contact else True,
+                "agent": None,
             }
             contact_cache[key] = fallback_contact
-            return {**customer, **fallback_contact}
+            return _merge_customer_contact(customer, fallback_contact)
         contact_cache[key] = contact
-        return {**customer, **contact}
+        return _merge_customer_contact(customer, contact)
 
     contacts: list[dict[str, Any]] = []
     worker_count = max(1, int(workers or CONTACT_PAGE_WORKERS))
@@ -993,7 +994,7 @@ def is_portal_customer_id(account_id: str) -> bool:
     return bool(account_id) and account_id.casefold().startswith("qm:")
 
 
-def has_issues(config: dict[str, str], account_id: str) -> bool:
+def has_issues(config: dict[str, str], account_id: str) -> bool | None:
     if not account_id or is_portal_customer_id(account_id):
         return False
     query = f'reporter = "{account_id}" OR creator = "{account_id}"'
@@ -1004,23 +1005,29 @@ def has_issues(config: dict[str, str], account_id: str) -> bool:
             api="jira",
             headers=jira_headers(config["jira_email"], config["jira_pat"]),
         )
-    except ApiError:
-        return False
+    except ApiError as error:
+        if error.status == 400:
+            return False
+        if error.status in {401, 403}:
+            raise
+        return None
     if not isinstance(response, dict):
-        return False
+        return None
     total = response.get("total")
-    if isinstance(total, int):
-        return total > 0
+    if isinstance(total, int) and not isinstance(total, bool):
+        return total > 0 if total >= 0 else None
     issues = response.get("issues")
-    return isinstance(issues, list) and bool(issues)
+    if isinstance(issues, list):
+        return bool(issues)
+    return None
 
 
 def has_issues_for_accounts(
     config: dict[str, str], account_ids: list[str], workers: int = CONTACT_PAGE_WORKERS
-) -> dict[str, bool]:
+) -> dict[str, bool | None]:
     if not account_ids:
         return {}
-    results: dict[str, bool] = {}
+    results: dict[str, bool | None] = {}
     worker_count = max(1, min(len(account_ids), workers or CONTACT_PAGE_WORKERS))
     with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = {
@@ -1029,10 +1036,7 @@ def has_issues_for_accounts(
         }
         for future in concurrent.futures.as_completed(futures):
             account_id = futures[future]
-            try:
-                results[account_id] = future.result()
-            except ApiError:
-                results[account_id] = False
+            results[account_id] = future.result()
     return results
 
 
@@ -1101,6 +1105,31 @@ def customer_status_label(status: str) -> str:
         "pending_login": "PENDING_LOGIN",
         "logged_in": "LOGGED_IN",
     }.get(status, status or "unknown")
+
+
+def _merge_customer_contact(
+    customer: dict[str, Any], contact: dict[str, Any]
+) -> dict[str, Any]:
+    account_id = str(
+        customer.get("customerAccountId")
+        or customer.get("accountId")
+        or customer.get("identifier")
+        or ""
+    )
+    merged = {
+        **customer,
+        **{
+            key: value
+            for key, value in contact.items()
+            if key not in {"accountId", "identifier", "customerAccountId"}
+        },
+        "accountId": account_id,
+        "customerAccountId": account_id,
+    }
+    contact_identifier = contact.get("identifier") or contact.get("accountId")
+    if contact_identifier:
+        merged["contactIdentifier"] = str(contact_identifier)
+    return merged
 
 
 def customer_url(config: dict[str, str], service_desk_id: str) -> str:
@@ -1178,10 +1207,9 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
         desks = resolve_service_desk_for_project(config, args.project_key)
     rows: list[dict[str, str]] = []
     requested_matches: set[str] = set()
-    candidates: list[tuple[dict[str, str], str, str]] = []
-    pending_portal_candidates: list[tuple[dict[str, str], str, str]] = []
+    eligible_candidates: list[tuple[dict[str, str], str, str]] = []
     error_count = 0
-    org_users = load_org_users(config)
+    org_users: dict[str, dict[str, Any]] | None = None
     contact_cache: dict[tuple[str, str], dict[str, Any]] = {}
 
     for desk in desks:
@@ -1203,28 +1231,20 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
             workers=args.workers,
         )
         for customer in customers:
-            account_id = str(customer.get("identifier") or customer.get("accountId") or "")
+            account_id = str(
+                customer.get("customerAccountId") or customer.get("accountId") or ""
+            )
             email = str(customer.get("email") or customer.get("emailAddress") or "")
             name = str(customer.get("displayName") or "")
             agent = customer.get("agent")
             match_keys = {key.casefold() for key in (account_id, email) if key}
             requested_matches.update(match_keys & input_ids)
             status = customer_status(customer)
-            account_type = (
-                "customer"
-                if is_portal_customer_id(account_id)
-                or str(customer.get("accountType") or customer.get("account_type") or "").casefold() == "customer"
-                else "agent"
-                if agent is True
-                else "atlassian"
-                if customer.get("accountType") == "atlassian"
-                else "unknown"
-            )
             row = {
                 "email": email,
                 "display_name": name,
                 "account_id": account_id,
-                "account_type": account_type,
+                "account_type": "unknown",
                 "service_desk": desk_name,
                 "status": customer_status_label(status),
                 "action": "skipped",
@@ -1245,28 +1265,15 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                 rows.append(row)
                 continue
 
-            if is_portal_customer_id(account_id) or str(
-                customer.get("accountType") or customer.get("account_type") or ""
-            ).casefold() == "customer":
-                if customer.get("agent") is not False:
-                    row["reason"] = (
-                        "contact is an agent and not a customer"
-                        if customer.get("agent") is True
-                        else "contact agent status is missing or invalid"
-                    )
-                    rows.append(row)
-                    continue
-                if status == "pending_login":
-                    pending_portal_candidates.append((row, desk_id, account_id))
-                elif status == "logged_in":
-                    row["reason"] = "customer has logged in / active"
-                    rows.append(row)
-                else:
-                    row["reason"] = "customer contact status is unavailable or not pending login"
-                    rows.append(row)
-                continue
-
             if agent is not False:
+                if agent is True:
+                    row["account_type"] = "agent"
+                elif is_portal_customer_id(account_id) or str(
+                    customer.get("accountType")
+                    or customer.get("account_type")
+                    or ""
+                ).casefold() == "customer":
+                    row["account_type"] = "customer"
                 row["reason"] = (
                     "contact is an agent and not a customer"
                     if agent is True
@@ -1275,34 +1282,77 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                 rows.append(row)
                 continue
 
-            profile = jira_user_profile(config, account_id)
-            org_user = org_users.get(account_id.casefold())
-            is_portal, portal_reason = is_portal_only(
-                str(profile.get("accountType") or profile.get("account_type") or "").casefold(),
-                org_user,
-                profile,
+            account_type = (
+                "customer"
+                if is_portal_customer_id(account_id)
+                or str(
+                    customer.get("accountType")
+                    or customer.get("account_type")
+                    or ""
+                ).casefold()
+                == "customer"
+                else "atlassian"
+                if str(
+                    customer.get("accountType")
+                    or customer.get("account_type")
+                    or ""
+                ).casefold()
+                == "atlassian"
+                else "unknown"
             )
-            if not is_portal:
-                row["reason"] = portal_reason or "account is not eligible for removal"
+            row["account_type"] = account_type
+
+            if status != "pending_login":
+                row["reason"] = (
+                    "customer has logged in / active"
+                    if status == "logged_in"
+                    else "contact is not in PENDING_LOGIN status"
+                )
                 rows.append(row)
                 continue
-            if status == "pending_login":
-                candidates.append((row, desk_id, account_id))
-            elif status == "logged_in":
-                row["reason"] = "customer has logged in / active"
-                rows.append(row)
-            else:
-                row["reason"] = "contact is not in PENDING_LOGIN status"
-                rows.append(row)
 
-    portal_issue_results = has_issues_for_accounts(
+            if account_type != "customer":
+                profile = jira_user_profile(config, account_id)
+                profile_type = str(
+                    profile.get("accountType") or profile.get("account_type") or ""
+                ).casefold()
+                org_user = None
+                if profile_type == "atlassian":
+                    if not config.get("org") or not config.get("token"):
+                        raise ValueError(
+                            "Organization API credentials are required to validate "
+                            "non-customer Atlassian accounts; provide --token and --org "
+                            "or ATLASSIAN_TOKEN and ATLASSIAN_ORG."
+                        )
+                    if org_users is None:
+                        org_users = load_org_users(config)
+                    org_user = org_users.get(account_id.casefold())
+                is_portal, portal_reason = is_portal_only(
+                    profile_type, org_user, profile
+                )
+                if not is_portal:
+                    row["reason"] = (
+                        portal_reason or "account is not eligible for removal"
+                    )
+                    rows.append(row)
+                    continue
+                row["account_type"] = profile_type
+
+            eligible_candidates.append((row, desk_id, account_id))
+
+    issue_results = has_issues_for_accounts(
         config,
-        [account_id for _, _, account_id in pending_portal_candidates],
+        [account_id for _, _, account_id in eligible_candidates],
         workers=args.workers,
     )
-    for row, desk_id, account_id in pending_portal_candidates:
-        if portal_issue_results.get(account_id, False):
+    candidates: list[tuple[dict[str, str], str, str]] = []
+    for row, desk_id, account_id in eligible_candidates:
+        issue_status = issue_results.get(account_id)
+        if issue_status is True:
             row["reason"] = "customer has reported or created issues"
+            rows.append(row)
+        elif issue_status is None:
+            row["reason"] = "customer issue history could not be verified"
             rows.append(row)
         else:
             candidates.append((row, desk_id, account_id))
