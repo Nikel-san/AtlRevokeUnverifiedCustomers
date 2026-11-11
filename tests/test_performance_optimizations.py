@@ -86,52 +86,6 @@ class PerformanceOptimizationTests(unittest.TestCase):
         create.assert_called_once_with("example.test", port=None, timeout=30)
         self.assertEqual(connection.request.call_count, 2)
 
-    def test_api_metrics_count_successes_failures_and_safe_categories(self) -> None:
-        app._reset_metrics()
-        responses = []
-        for status, body in (
-            (200, b'{"ok": true}'),
-            (500, b'{"error": true}'),
-            (429, b'{"error": true}'),
-        ):
-            response = mock.Mock(status=status, headers={})
-            response.read.return_value = body
-            responses.append(response)
-        connection = mock.Mock()
-        connection.getresponse.side_effect = responses
-        with (
-            mock.patch.object(app.http.client, "HTTPSConnection", return_value=connection),
-            mock.patch.object(app, "MAX_READ_RETRIES", 0),
-        ):
-            app.request_json(
-                "https://example.test/rest/api/3/search?jql=private%40example.test",
-                api="jira",
-                headers={"Authorization": "secret"},
-            )
-            with self.assertRaisesRegex(app.ApiError, "HTTP 500"):
-                app.request_json(
-                    "https://example.test/rest/servicedesk/1/project/34/contacts",
-                    api="jira",
-                    headers={"Authorization": "secret"},
-                )
-            with self.assertRaisesRegex(app.ApiError, "HTTP 429"):
-                app.request_json(
-                    "https://example.test/rest/servicedesk/1/project/34/contacts",
-                    api="jira",
-                    headers={"Authorization": "secret"},
-                )
-
-        metrics = app._metrics_snapshot()
-        self.assertEqual(metrics["requests"], 3)
-        self.assertEqual(metrics["successful_requests"], 1)
-        self.assertEqual(metrics["failed_requests"], 2)
-        self.assertEqual(metrics["http_429"], 1)
-        self.assertEqual(metrics["http_5xx"], 1)
-        self.assertIn("jira.issue-history", metrics["categories"])
-        self.assertIn("jira.project-contacts.bulk", metrics["categories"])
-        self.assertNotIn("private", repr(metrics))
-        self.assertNotIn("secret", repr(metrics))
-
     def test_project_contact_index_is_reused_between_service_desks(self) -> None:
         requests: list[str] = []
         config = {
@@ -176,7 +130,6 @@ class PerformanceOptimizationTests(unittest.TestCase):
                 }
             raise AssertionError(f"unexpected individual lookup: {url}")
 
-        app._reset_metrics()
         with mock.patch.object(app, "request_json", side_effect=fake_request):
             first = app.list_customers(
                 config,
@@ -200,10 +153,7 @@ class PerformanceOptimizationTests(unittest.TestCase):
         self.assertEqual([first[0]["accountId"], second[0]["accountId"]], ["qm:12", "qm:13"])
         self.assertEqual(first[0]["loggedInStatus"], "PENDING_LOGIN")
         self.assertEqual(second[0]["loggedInStatus"], "PENDING_LOGIN")
-        metrics = app._metrics_snapshot()
-        self.assertEqual(metrics["bulk_contact_lookups"], 1)
-        self.assertEqual(metrics["individual_contact_lookups"], 0)
-        self.assertEqual(metrics["contact_cache_misses"], 2)
+        self.assertFalse(any("query=" in url for url in requests))
 
     def test_project_contact_indexes_are_separate_by_project(self) -> None:
         bulk_projects: list[str] = []
@@ -271,7 +221,6 @@ class PerformanceOptimizationTests(unittest.TestCase):
                 ]
             }
 
-        app._reset_metrics()
         with mock.patch.object(app, "request_json", side_effect=fake_request):
             customers = app.list_customers(
                 {
@@ -286,9 +235,6 @@ class PerformanceOptimizationTests(unittest.TestCase):
         self.assertEqual(queries, [None, email])
         self.assertEqual(customers[0]["accountId"], "qm:unresolved")
         self.assertEqual(customers[0]["contactIdentifier"], "contact-id")
-        metrics = app._metrics_snapshot()
-        self.assertEqual(metrics["bulk_contact_lookups"], 1)
-        self.assertEqual(metrics["individual_contact_lookups"], 1)
 
     def test_individual_contact_cache_hit_avoids_project_bulk_request(self) -> None:
         requests: list[str] = []
@@ -299,23 +245,31 @@ class PerformanceOptimizationTests(unittest.TestCase):
             if "/servicedeskapi/servicedesk/" in parsed.path:
                 return {
                     "isLastPage": True,
-                    "values": [{"accountId": "qm:cached"}],
-                }
+                        "values": [
+                            {
+                                "accountId": "qm:cached",
+                                "emailAddress": "cached@example.test",
+                            }
+                        ],
+                    }
             if parsed.path.endswith("/contacts"):
-                return {
-                    "contactResults": [
-                        {
-                            "identifier": "qm:cached",
-                            "loggedInStatus": "PENDING_LOGIN",
-                            "agent": False,
-                        }
-                    ]
-                }
-            raise AssertionError(f"unexpected individual lookup: {url}")
+                    query = urllib.parse.parse_qs(parsed.query).get("query", [None])[0]
+                    if query is None:
+                        return {"contactResults": []}
+                    self.assertEqual(query, "cached@example.test")
+                    return {
+                        "contactResults": [
+                            {
+                                "identifier": "contact-id",
+                                "loggedInStatus": "PENDING_LOGIN",
+                                "agent": False,
+                            }
+                        ]
+                    }
+            raise AssertionError(f"unexpected request: {url}")
 
         contact_cache: dict[tuple[str, str], dict] = {}
         project_cache: dict[str, tuple[dict[str, dict | None], ...]] = {}
-        app._reset_metrics()
         with mock.patch.object(app, "request_json", side_effect=fake_request):
             for _ in range(2):
                 app.list_customers(
@@ -331,13 +285,19 @@ class PerformanceOptimizationTests(unittest.TestCase):
                 )
 
         self.assertEqual(
-            sum(urllib.parse.urlsplit(url).path.endswith("/contacts") for url in requests),
-            1,
+            sum(
+                urllib.parse.urlsplit(url).path.endswith("/contacts")
+                for url in requests
+            ),
+            2,
         )
-        metrics = app._metrics_snapshot()
-        self.assertEqual(metrics["contact_cache_hits"], 1)
-        self.assertEqual(metrics["contact_cache_misses"], 1)
-        self.assertEqual(metrics["bulk_contact_lookups"], 1)
+        contact_queries = [
+            urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("query")
+            for url in requests
+            if urllib.parse.urlsplit(url).path.endswith("/contacts")
+        ]
+        self.assertEqual(contact_queries, [None, ["cached@example.test"]])
+        self.assertEqual(len(requests), 4)
 
     def test_public_customer_pages_are_enriched_with_contact_details(self) -> None:
         page_starts: list[int] = []
@@ -1401,6 +1361,14 @@ class PerformanceOptimizationTests(unittest.TestCase):
                 self.assertEqual(rows[0]["action"], "would remove")
                 self.assertEqual(list_customers.call_args.kwargs["workers"], contact_workers)
                 self.assertEqual(issue_check.call_args.kwargs["workers"], issue_workers)
+
+    def test_worker_options_require_positive_integers(self) -> None:
+        for option in ("--workers", "--contact-workers", "--issue-workers"):
+            for value in ("0", "-1", "invalid"):
+                with self.subTest(option=option, value=value):
+                    with self.assertRaises(SystemExit) as error:
+                        app.parse_args(["-d", "12", option, value])
+                    self.assertEqual(error.exception.code, 2)
 
     def test_delete_failure_is_not_retried(self) -> None:
         response = mock.Mock(status=500)

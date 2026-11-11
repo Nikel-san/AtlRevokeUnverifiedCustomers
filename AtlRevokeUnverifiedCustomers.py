@@ -54,97 +54,6 @@ ANSI_GREEN = "\033[32m"
 _connection_local = threading.local()
 _connections: set[http.client.HTTPConnection] = set()
 _connections_lock = threading.Lock()
-_metrics_lock = threading.Lock()
-_metrics: dict[str, Any] = {}
-
-
-def _reset_metrics() -> None:
-    global _metrics
-    with _metrics_lock:
-        _metrics = {
-            "requests": 0,
-            "successful_requests": 0,
-            "failed_requests": 0,
-            "http_429": 0,
-            "http_5xx": 0,
-            "api_elapsed_seconds": 0.0,
-            "categories": {},
-            "contact_cache_hits": 0,
-            "contact_cache_misses": 0,
-            "individual_contact_lookups": 0,
-            "bulk_contact_lookups": 0,
-            "issue_history_lookups": 0,
-        }
-
-
-def _metric_increment(name: str, amount: int = 1) -> None:
-    with _metrics_lock:
-        _metrics[name] = _metrics.get(name, 0) + amount
-
-
-def _api_category(path: str, method: str, api: str) -> str:
-    parsed_path = urllib.parse.urlsplit(path)
-    if method.upper() == "DELETE":
-        return "jira.customer-removal"
-    if parsed_path.path.endswith("/contacts"):
-        return (
-            "jira.project-contacts.individual"
-            if parsed_path.query
-            else "jira.project-contacts.bulk"
-        )
-    if parsed_path.path.endswith("/search"):
-        return "jira.issue-history"
-    if parsed_path.path.endswith("/customer"):
-        return "jira.customer-list"
-    if "/rest/api/3/user" in parsed_path.path:
-        return "jira.user-profile"
-    if "/rest/servicedeskapi/servicedesk" in parsed_path.path:
-        return "jira.service-desk"
-    if api == "organization":
-        return "organization.directory"
-    return f"{api}.other"
-
-
-def _record_api_request(
-    category: str, elapsed: float, status: int | None, succeeded: bool
-) -> None:
-    with _metrics_lock:
-        category_metrics = _metrics.setdefault("categories", {}).setdefault(
-            category,
-            {"requests": 0, "successful": 0, "failed": 0, "elapsed_seconds": 0.0},
-        )
-        _metrics["requests"] = _metrics.get("requests", 0) + 1
-        _metrics["api_elapsed_seconds"] = (
-            _metrics.get("api_elapsed_seconds", 0.0) + elapsed
-        )
-        category_metrics["requests"] += 1
-        category_metrics["elapsed_seconds"] += elapsed
-        if succeeded:
-            _metrics["successful_requests"] += 1
-            category_metrics["successful"] += 1
-        else:
-            _metrics["failed_requests"] += 1
-            category_metrics["failed"] += 1
-        if status == 429:
-            _metrics["http_429"] += 1
-        if status is not None and 500 <= status <= 599:
-            _metrics["http_5xx"] += 1
-
-
-def _metrics_snapshot() -> dict[str, Any]:
-    with _metrics_lock:
-        return {
-            **_metrics,
-            "categories": {
-                category: dict(counts)
-                for category, counts in _metrics.get("categories", {}).items()
-            },
-        }
-
-
-_reset_metrics()
-
-
 class ApiError(Exception):
     def __init__(self, api: str, message: str, status: int | None = None):
         super().__init__(message)
@@ -248,11 +157,7 @@ def request_json(
         request_headers["Content-Type"] = "application/json"
         payload = json.dumps(body).encode("utf-8")
     retryable = method.upper() == "GET"
-    category = _api_category(request_path, method, api)
     for attempt in range(MAX_READ_RETRIES + 1):
-        attempt_started = time.perf_counter()
-        status: int | None = None
-        succeeded = False
         connection = _get_connection(parsed_url.scheme, host, port)
         try:
             connection.request(
@@ -262,7 +167,6 @@ def request_json(
                 headers=request_headers,
             )
             response = connection.getresponse()
-            status = response.status
             response_body = response.read()
             if response.status >= 400:
                 if (
@@ -273,7 +177,6 @@ def request_json(
                     time.sleep(_retry_delay(attempt, response.headers))
                     continue
                 raise ApiError(api, f"HTTP {response.status}", response.status)
-            succeeded = True
             break
         except ApiError:
             raise
@@ -283,13 +186,6 @@ def request_json(
                 time.sleep(_retry_delay(attempt))
                 continue
             raise ApiError(api, f"request failed: {request_error}") from None
-        finally:
-            _record_api_request(
-                category,
-                time.perf_counter() - attempt_started,
-                status,
-                succeeded,
-            )
 
     if not response_body:
         return {}
@@ -948,19 +844,16 @@ def list_customers(
         if not account_id:
             enriched_by_id[""] = customer
             continue
-        key = (str(resolved_project_id), account_id)
+        key = (str(resolved_project_id), account_id        )
         if key in contact_cache:
-            _metric_increment("contact_cache_hits")
             enriched_by_id[account_id.casefold()] = _merge_customer_contact(
                 customer, contact_cache[key]
             )
         else:
-            _metric_increment("contact_cache_misses")
             pending_customers.append(customer)
 
     contact_indexes = project_contact_cache.get(str(resolved_project_id))
     if pending_customers and contact_indexes is None:
-        _metric_increment("bulk_contact_lookups")
         try:
             project_contacts = _list_project_contacts(
                 config, str(resolved_project_id), headers
@@ -1013,7 +906,6 @@ def list_customers(
         def find_contact_by_query(
             query: str, *, is_email_query: bool
         ) -> dict[str, Any] | None:
-            _metric_increment("individual_contact_lookups")
             contact_query = urllib.parse.urlencode({"query": query})
             contact_url = (
                 f"{config['site']}/rest/servicedesk/1/project/"
@@ -1120,7 +1012,6 @@ def is_portal_customer_id(account_id: str) -> bool:
 def has_issues(config: dict[str, str], account_id: str) -> bool | None:
     if not account_id or is_portal_customer_id(account_id):
         return False
-    _metric_increment("issue_history_lookups")
     query = f'reporter = "{account_id}" OR creator = "{account_id}"'
     encoded_query = urllib.parse.quote(query)
     try:
@@ -1331,42 +1222,7 @@ def print_row(row: dict[str, str]) -> None:
     )
 
 
-def print_metrics(execution_seconds: float) -> None:
-    metrics = _metrics_snapshot()
-    print("Performance metrics:")
-    print(
-        "  API requests: "
-        f"{metrics['requests']} total, "
-        f"{metrics['successful_requests']} successful, "
-        f"{metrics['failed_requests']} failed; "
-        f"429={metrics['http_429']}, 5xx={metrics['http_5xx']}"
-    )
-    print(
-        "  API time: "
-        f"{metrics['api_elapsed_seconds']:.2f}s; "
-        f"execution time: {execution_seconds:.2f}s"
-    )
-    print(
-        "  Contact lookups: "
-        f"bulk={metrics['bulk_contact_lookups']}, "
-        f"individual={metrics['individual_contact_lookups']}, "
-        f"cache hits={metrics['contact_cache_hits']}, "
-        f"cache misses={metrics['contact_cache_misses']}"
-    )
-    print(f"  Issue-history lookups: {metrics['issue_history_lookups']}")
-    if metrics["categories"]:
-        print("  Requests by category:")
-        for category, counts in sorted(metrics["categories"].items()):
-            print(
-                f"    {category}: {counts['requests']} total, "
-                f"{counts['successful']} successful, {counts['failed']} failed, "
-                f"{counts['elapsed_seconds']:.2f}s"
-            )
-
-
 def process(args: argparse.Namespace, config: dict[str, str]) -> int:
-    _reset_metrics()
-    execution_started = time.perf_counter()
     if args.out:
         report_path = Path(args.out)
         if report_path.exists():
@@ -1638,9 +1494,18 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
     print(f"  Removed: {removed_count}")
     print(f"  Skipped: {skipped_count}")
     print(f"  Errors: {error_count}")
-    print_metrics(time.perf_counter() - execution_started)
     success(f"CSV report written to {report_path}")
     return 1 if error_count else 0
+
+
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer") from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1706,18 +1571,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--workers",
-        type=int,
+        type=positive_int,
         default=CONTACT_PAGE_WORKERS,
         help="Backward-compatible default concurrency for contacts and issue checks",
     )
     parser.add_argument(
         "--contact-workers",
-        type=int,
+        type=positive_int,
         help="Maximum concurrent contact-detail requests (default: --workers)",
     )
     parser.add_argument(
         "--issue-workers",
-        type=int,
+        type=positive_int,
         help="Maximum concurrent issue-history requests (default: --workers)",
     )
     return parser.parse_args(argv)

@@ -158,8 +158,8 @@ empty input file selects no customers. `-f` / `--exclude-file` (alias
 
 `--workers` sets the backward-compatible concurrency default for contact and
 issue checks. `--contact-workers` and `--issue-workers` override these limits
-independently. Worker counts are capped at 32; API metrics are printed at the
-end of a completed run.
+independently. Each value must be a positive integer; worker counts are capped
+at 32.
 
 Runs remove access by default. Pass `--dry-run` to inspect the console
 decisions and timestamped CSV report without making changes. Reports are

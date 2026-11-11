@@ -105,10 +105,8 @@ python .\AtlRevokeUnverifiedCustomers.py -d 12
 The script prints each customer’s email, display name, account ID, account
 type, service desk, status, action, and reason, followed by a summary of desks
 processed, customers scanned, candidates, would-remove/removed totals, skips,
-and errors. It also prints request counts by endpoint category, HTTP failures,
-contact-cache statistics, lookup counts, and elapsed time. `WARN`, `SUCCESS`,
-and `ERROR` labels and action statuses use color in interactive terminals and
-respect `NO_COLOR`.
+and errors. `WARN`, `SUCCESS`, and `ERROR` labels and action statuses use color
+in interactive terminals and respect `NO_COLOR`.
 
 The CSV report contains these columns:
 
