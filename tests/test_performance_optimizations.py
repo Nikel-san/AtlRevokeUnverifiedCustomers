@@ -19,6 +19,7 @@ class PerformanceOptimizationTests(unittest.TestCase):
         profile: dict | None = None,
         org_users: dict | None = None,
         dry_run: bool = True,
+        agent_provenance: bool = True,
     ) -> tuple[int, list[dict[str, str]], mock.Mock, mock.Mock, mock.Mock]:
         argv = ["-d", "12"]
         if dry_run:
@@ -30,6 +31,11 @@ class PerformanceOptimizationTests(unittest.TestCase):
             "jira_pat": "not-used",
         }
         report_rows: list[dict[str, str]] = []
+        customer_records = [dict(customer) for customer in customers]
+        if agent_provenance:
+            for customer in customer_records:
+                if isinstance(customer.get("agent"), bool):
+                    customer["contactAgentVerified"] = True
 
         with (
             mock.patch.object(
@@ -37,7 +43,7 @@ class PerformanceOptimizationTests(unittest.TestCase):
                 "request_json",
                 return_value={"id": "12", "projectId": "34", "projectName": "HELP"},
             ) as request_json,
-            mock.patch.object(app, "list_customers", return_value=customers),
+            mock.patch.object(app, "list_customers", return_value=customer_records),
             mock.patch.object(
                 app,
                 "write_report",
@@ -476,6 +482,7 @@ class PerformanceOptimizationTests(unittest.TestCase):
                     "values": [
                         {
                             "accountId": original_account_id,
+                            "customerAccountId": contact_identifier,
                             "emailAddress": "portal@example.test",
                             "displayName": "Portal Customer",
                         }
@@ -499,6 +506,8 @@ class PerformanceOptimizationTests(unittest.TestCase):
         self.assertEqual(customers[0]["accountId"], original_account_id)
         self.assertEqual(customers[0]["customerAccountId"], original_account_id)
         self.assertEqual(customers[0]["contactIdentifier"], contact_identifier)
+        self.assertTrue(customers[0]["contactAgentVerified"])
+        self.assertIs(customers[0]["agent"], False)
 
         args = app.parse_args(["-d", "12"])
         deletion_calls: list[dict] = []
@@ -547,8 +556,9 @@ class PerformanceOptimizationTests(unittest.TestCase):
             ({"total": 0}, False),
             ({"total": 1}, True),
             ({"total": -1}, None),
-            ({"issues": []}, False),
-            ({"issues": [{}]}, True),
+            ({"issues": []}, None),
+            ({"issues": [{}]}, None),
+            ({"total": False}, None),
             ({"unknown": True}, None),
         ):
             with self.subTest(response=response):
@@ -622,6 +632,38 @@ class PerformanceOptimizationTests(unittest.TestCase):
                 ):
                     self.assertEqual(app.main(["-d", "12"]), 2)
 
+    def test_issue_batch_records_unexpected_failures_as_unverifiable(self) -> None:
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+
+        def fail_issue_check(config: dict[str, str], account_id: str) -> bool:
+            if account_id == "account-api-error":
+                raise app.ApiError("jira", "HTTP 500", 500)
+            raise RuntimeError("unexpected failure")
+
+        with mock.patch.object(app, "has_issues", side_effect=fail_issue_check):
+            results = app.has_issues_for_accounts(
+                config, ["account-api-error", "account-unexpected"]
+            )
+        self.assertEqual(
+            results,
+            {"account-api-error": None, "account-unexpected": None},
+        )
+
+    def test_issue_batch_rejects_non_boolean_results(self) -> None:
+        config = {
+            "site": "https://example.test",
+            "jira_email": "user@example.test",
+            "jira_pat": "not-used",
+        }
+        with mock.patch.object(app, "has_issues", return_value="no") as has_issues:
+            results = app.has_issues_for_accounts(config, ["account-1"])
+        self.assertEqual(results, {"account-1": None})
+        has_issues.assert_called_once_with(config, "account-1")
+
     def test_non_portal_candidates_require_issue_verification(self) -> None:
         base = {
             "accountId": "712020:customer",
@@ -662,6 +704,27 @@ class PerformanceOptimizationTests(unittest.TestCase):
             rows[0]["reason"], "customer issue history could not be verified"
         )
         self.assertEqual(request_json.call_count, 1)
+
+    def test_candidate_requires_issue_result_to_be_explicitly_false(self) -> None:
+        customer = {
+            "accountId": "qm:unexpected-issue-result",
+            "agent": False,
+            "loggedInStatus": "PENDING_LOGIN",
+        }
+        result, rows, request_json, _, _ = self.run_process_with_customers(
+            [customer], {"qm:unexpected-issue-result": "false"}
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(rows[0]["action"], "skipped")
+        self.assertEqual(
+            rows[0]["reason"], "customer issue history could not be verified"
+        )
+        self.assertFalse(
+            any(
+                call.kwargs.get("method") == "DELETE"
+                for call in request_json.call_args_list
+            )
+        )
 
     def test_unknown_invitation_status_never_becomes_candidate(self) -> None:
         customer = {
@@ -749,6 +812,7 @@ class PerformanceOptimizationTests(unittest.TestCase):
         customer = {
             "accountId": "standard-account",
             "agent": False,
+            "contactAgentVerified": True,
             "loggedInStatus": "PENDING_LOGIN",
         }
         profile = {
@@ -931,6 +995,7 @@ class PerformanceOptimizationTests(unittest.TestCase):
                                     "email": "agent@example.test",
                                     "displayName": "Agent",
                                     "loggedInStatus": "PENDING_LOGIN",
+                                    "contactAgentVerified": True,
                                 },
                                 **(
                                     {}
@@ -967,6 +1032,23 @@ class PerformanceOptimizationTests(unittest.TestCase):
                 has_issues.assert_called_once_with(
                     config, account_ids, workers=args.workers
                 )
+
+    def test_synthesized_agent_false_without_contact_provenance_is_skipped(self) -> None:
+        customer = {
+            "accountId": "qm:synthesized-agent",
+            "accountType": "customer",
+            "agent": False,
+            "loggedInStatus": "PENDING_LOGIN",
+        }
+        result, rows, _, issue_check, _ = self.run_process_with_customers(
+            [customer], {"qm:synthesized-agent": False}, agent_provenance=False
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(rows[0]["action"], "skipped")
+        self.assertEqual(
+            rows[0]["reason"], "contact agent status is missing or invalid"
+        )
+        issue_check.assert_called_once_with(mock.ANY, [], workers=app.CONTACT_PAGE_WORKERS)
 
     def test_is_portal_only_allows_customer_without_org_entry(self) -> None:
         self.assertEqual(app.is_portal_only("customer", None, None), (True, ""))

@@ -826,7 +826,16 @@ def list_customers(
                 continue
             if input_ids and not (match_keys & input_ids):
                 continue
-            customers.append(customer)
+            canonical_account_id = str(
+                customer.get("accountId") or customer.get("identifier") or ""
+            )
+            customers.append(
+                {
+                    **customer,
+                    "accountId": canonical_account_id,
+                    "customerAccountId": canonical_account_id,
+                }
+            )
             new_items += 1
 
         if is_tty:
@@ -1011,15 +1020,14 @@ def has_issues(config: dict[str, str], account_id: str) -> bool | None:
         if error.status in {401, 403}:
             raise
         return None
+    except (OSError, http.client.HTTPException):
+        return None
     if not isinstance(response, dict):
         return None
     total = response.get("total")
-    if isinstance(total, int) and not isinstance(total, bool):
-        return total > 0 if total >= 0 else None
-    issues = response.get("issues")
-    if isinstance(issues, list):
-        return bool(issues)
-    return None
+    if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+        return None
+    return total > 0
 
 
 def has_issues_for_accounts(
@@ -1036,7 +1044,30 @@ def has_issues_for_accounts(
         }
         for future in concurrent.futures.as_completed(futures):
             account_id = futures[future]
-            results[account_id] = future.result()
+            try:
+                result = future.result()
+                if result is True or result is False or result is None:
+                    results[account_id] = result
+                else:
+                    warn(
+                        f"Issue verification returned an invalid result for "
+                        f"{account_id}; the customer will be skipped."
+                    )
+                    results[account_id] = None
+            except ApiError as error:
+                if error.status in {401, 403}:
+                    raise
+                warn(
+                    f"Issue verification failed for {account_id} ({error}); "
+                    "the customer will be skipped."
+                )
+                results[account_id] = None
+            except Exception as error:
+                warn(
+                    f"Issue verification failed for {account_id} ({error}); "
+                    "the customer will be skipped."
+                )
+                results[account_id] = None
     return results
 
 
@@ -1111,8 +1142,8 @@ def _merge_customer_contact(
     customer: dict[str, Any], contact: dict[str, Any]
 ) -> dict[str, Any]:
     account_id = str(
-        customer.get("customerAccountId")
-        or customer.get("accountId")
+        customer.get("accountId")
+        or customer.get("customerAccountId")
         or customer.get("identifier")
         or ""
     )
@@ -1126,6 +1157,9 @@ def _merge_customer_contact(
         "accountId": account_id,
         "customerAccountId": account_id,
     }
+    contact_agent = contact.get("agent")
+    merged["agent"] = contact_agent if isinstance(contact_agent, bool) else None
+    merged["contactAgentVerified"] = isinstance(contact_agent, bool)
     contact_identifier = contact.get("identifier") or contact.get("accountId")
     if contact_identifier:
         merged["contactIdentifier"] = str(contact_identifier)
@@ -1232,11 +1266,12 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
         )
         for customer in customers:
             account_id = str(
-                customer.get("customerAccountId") or customer.get("accountId") or ""
+                customer.get("accountId") or customer.get("customerAccountId") or ""
             )
             email = str(customer.get("email") or customer.get("emailAddress") or "")
             name = str(customer.get("displayName") or "")
             agent = customer.get("agent")
+            agent_is_verified = customer.get("contactAgentVerified") is True
             match_keys = {key.casefold() for key in (account_id, email) if key}
             requested_matches.update(match_keys & input_ids)
             status = customer_status(customer)
@@ -1265,7 +1300,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                 rows.append(row)
                 continue
 
-            if agent is not False:
+            if not agent_is_verified or agent is not False:
                 if agent is True:
                     row["account_type"] = "agent"
                 elif is_portal_customer_id(account_id) or str(
@@ -1351,11 +1386,11 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
         if issue_status is True:
             row["reason"] = "customer has reported or created issues"
             rows.append(row)
-        elif issue_status is None:
+        elif issue_status is False:
+            candidates.append((row, desk_id, account_id))
+        else:
             row["reason"] = "customer issue history could not be verified"
             rows.append(row)
-        else:
-            candidates.append((row, desk_id, account_id))
 
     if input_ids:
         missing_inputs = input_ids - requested_matches
