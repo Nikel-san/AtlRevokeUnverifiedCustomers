@@ -1187,8 +1187,10 @@ def normalize_customer_status(value: Any) -> str:
     aliases = {
         "pendinglogin": "pending_login",
         "pending_login": "pending_login",
+        "has_pending_login": "pending_login",
         "loggedin": "logged_in",
         "logged_in": "logged_in",
+        "has_logged_in": "logged_in",
     }
     return aliases.get(normalized, normalized)
 
@@ -1213,8 +1215,10 @@ def customer_status_label(status: str) -> str:
     return {
         "pending_login": "PENDING_LOGIN",
         "pendinglogin": "PENDING_LOGIN",
+        "has_pending_login": "PENDING_LOGIN",
         "logged_in": "LOGGED_IN",
         "loggedin": "LOGGED_IN",
+        "has_logged_in": "LOGGED_IN",
     }.get(status, status or "unknown")
 
 

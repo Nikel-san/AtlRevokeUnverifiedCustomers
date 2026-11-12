@@ -537,6 +537,16 @@ class PerformanceOptimizationTests(unittest.TestCase):
         request_json.assert_called_once()
         self.assertNotIn("start=", request_json.call_args.args[0])
 
+    def test_status_aliases_map_active_users_to_logged_in(self) -> None:
+        self.assertEqual(app.normalize_customer_status("has_logged_in"), "logged_in")
+        self.assertEqual(app.normalize_customer_status("has_pending_login"), "pending_login")
+        self.assertIsNotNone(
+            app.customer_status({"loggedInStatus": "has_logged_in"})
+        )
+        self.assertTrue(
+            app._is_complete_contact({"agent": False, "loggedInStatus": "has_logged_in"})
+        )
+
     def test_portal_customer_without_contact_record_is_not_assumed_pending_login(self) -> None:
         def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
             parsed_url = urllib.parse.urlsplit(url)
