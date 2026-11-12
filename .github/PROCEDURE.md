@@ -174,8 +174,10 @@ python .\AtlRevokeUnverifiedCustomers.py -d 12
 ```
 
 Without `--dry-run`, the script batches customer removals through the JSM
-service-desk customer endpoint. It does not call any account deletion or
-deactivation endpoint.
+service-desk customer endpoint, which requires a closed-access service desk and
+accepts portal `qm:` account IDs. Jira JSON error details are included in API
+exceptions and removal failure reports. It does not call any account deletion
+or deactivation endpoint.
 
 Console and CSV output include the account type and contact `loggedInStatus`
 (`PENDING_LOGIN`, `LOGGED_IN`, or the endpoint-reported state) alongside the

@@ -56,10 +56,43 @@ _connection_local = threading.local()
 _connections: set[http.client.HTTPConnection] = set()
 _connections_lock = threading.Lock()
 class ApiError(Exception):
-    def __init__(self, api: str, message: str, status: int | None = None):
+    def __init__(
+        self, api: str, message: str, status: int | None = None, body: Any = None
+    ):
         super().__init__(message)
         self.api = api
         self.status = status
+        self.body = body
+
+
+def _format_error_detail(body: Any) -> str | None:
+    if isinstance(body, dict):
+        details = []
+        for key in ("message", "errorMessage", "errorMessages", "errors"):
+            value = body.get(key)
+            if value is None or value == "" or value == [] or value == {}:
+                continue
+            details.append(
+                value
+                if isinstance(value, str)
+                else json.dumps(value, ensure_ascii=False, sort_keys=True)
+            )
+        if details:
+            return "; ".join(details)
+    if body is None:
+        return None
+    if isinstance(body, str):
+        return body
+    return json.dumps(body, ensure_ascii=False, sort_keys=True)
+
+
+def _parse_error_body(response_body: bytes) -> Any:
+    if not response_body:
+        return None
+    try:
+        return json.loads(response_body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return response_body.decode("utf-8", errors="replace")
 
 
 def _print_status(label: str, message: str, color: str, *, stream: Any) -> None:
@@ -177,7 +210,14 @@ def request_json(
                 ):
                     time.sleep(_retry_delay(attempt, response.headers))
                     continue
-                raise ApiError(api, f"HTTP {response.status}", response.status)
+                error_body = _parse_error_body(response_body)
+                detail = _format_error_detail(error_body)
+                message = (
+                    f"HTTP {response.status}: {detail}"
+                    if detail
+                    else f"HTTP {response.status}"
+                )
+                raise ApiError(api, message, response.status, error_body)
             break
         except ApiError:
             raise

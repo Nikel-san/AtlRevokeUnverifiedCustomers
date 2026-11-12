@@ -157,4 +157,6 @@ missing, that account is skipped and processing continues.
 Transient read-only GET failures (HTTP 429 and common 5xx responses) are
 retried with bounded backoff. HTTPS connections are reused, and fallback
 contact lookups run concurrently. Removal requests are never automatically
-retried and are sent in batches of 50.
+retried and are sent in batches of 50. The JSM removal endpoint requires a
+closed-access service desk. Jira error response details are included in removal
+failure messages and CSV reasons to help diagnose rejected requests.
