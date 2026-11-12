@@ -698,13 +698,72 @@ def _list_project_contacts(
     project_id: str,
     headers: dict[str, str],
 ) -> list[dict[str, Any]]:
-    page_url = (
-        f"{config['site']}/rest/servicedesk/1/project/"
-        f"{urllib.parse.quote(project_id, safe='')}/contacts"
-    )
-    response = request_json(page_url, api="jira", headers=headers)
-    page_values, _ = _parse_contact_page(response)
-    return [item for item in page_values if isinstance(item, dict)]
+    start = 0
+    all_contacts: list[dict[str, Any]] = []
+    seen_pages: set[tuple[str, ...]] = set()
+    while True:
+        base_url = (
+            f"{config['site']}/rest/servicedesk/1/project/"
+            f"{urllib.parse.quote(project_id, safe='')}/contacts"
+        )
+        page_url = base_url
+        if start:
+            page_url = f"{base_url}?{urllib.parse.urlencode({'start': start, 'limit': PROJECT_CONTACT_PAGE_SIZE})}"
+        response = request_json(
+            page_url,
+            api="jira",
+            headers=headers,
+        )
+        page_values, metadata = _parse_contact_page(response)
+        contacts = [item for item in page_values if isinstance(item, dict)]
+
+        page_signature = tuple(
+            sorted(
+                {
+                    str(item.get("identifier") or item.get("accountId") or "")
+                    for item in contacts
+                }
+            )
+        )
+        if page_signature and page_signature in seen_pages:
+            raise ApiError(
+                "jira",
+                f"project contact pagination repeated a page at start={start}",
+            )
+        if page_signature:
+            seen_pages.add(page_signature)
+
+        all_contacts.extend(contacts)
+        is_last_page = response.get("isLastPage") if isinstance(response, dict) else None
+        total = metadata.get("total") if isinstance(metadata, dict) else None
+        has_paging_hint = bool(
+            isinstance(metadata, dict)
+            and any(
+                key in metadata
+                for key in ("start", "total", "next", "nextPageToken")
+            )
+        ) or (
+            isinstance(is_last_page, bool)
+            and is_last_page is False
+            and len(contacts) >= PROJECT_CONTACT_PAGE_SIZE
+        )
+        if is_last_page is True:
+            break
+        if not contacts:
+            if is_last_page is False:
+                raise ApiError(
+                    "jira",
+                    f"project contact page at start={start} was empty but marked as not last",
+                )
+            break
+        if not has_paging_hint:
+            break
+        if isinstance(total, int) and total >= 0 and start + len(contacts) >= total:
+            break
+        if is_last_page is not False and len(contacts) < PROJECT_CONTACT_PAGE_SIZE:
+            break
+        start += len(contacts)
+    return all_contacts
 
 
 def list_customers(

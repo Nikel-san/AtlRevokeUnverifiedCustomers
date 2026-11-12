@@ -537,6 +537,32 @@ class PerformanceOptimizationTests(unittest.TestCase):
         request_json.assert_called_once()
         self.assertNotIn("start=", request_json.call_args.args[0])
 
+    def test_project_contact_bulk_paging_reads_all_pages(self) -> None:
+        config = {"site": "https://example.test"}
+        contact_ids = [f"contact-{index}" for index in range(0, 175)]
+
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            params = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+            start = int(params.get("start", ["0"])[0])
+            limit = int(params.get("limit", [str(app.PROJECT_CONTACT_PAGE_SIZE)])[0])
+            end = min(start + limit, len(contact_ids))
+            is_last_page = end >= len(contact_ids)
+            return {
+                "contactResults": [
+                    {"identifier": contact_id, "loggedInStatus": "PENDING_LOGIN", "agent": False}
+                    for contact_id in contact_ids[start:end]
+                ],
+                "contactPageMetadata": {"start": start, "total": len(contact_ids)},
+                "isLastPage": is_last_page,
+            }
+
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            contacts = app._list_project_contacts(config, "34", {})
+
+        self.assertEqual(len(contacts), len(contact_ids))
+        self.assertEqual(contacts[0]["identifier"], "contact-0")
+        self.assertEqual(contacts[-1]["identifier"], "contact-174")
+
     def test_status_aliases_map_active_users_to_logged_in(self) -> None:
         self.assertEqual(app.normalize_customer_status("has_logged_in"), "logged_in")
         self.assertEqual(app.normalize_customer_status("has_pending_login"), "pending_login")
