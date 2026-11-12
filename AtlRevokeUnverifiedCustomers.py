@@ -1277,6 +1277,18 @@ def is_portal_only(
     return True, ""
 
 
+CUSTOMER_STATUS_ALIASES = {
+    "pendinglogin": "pending_login",
+    "pending_login": "pending_login",
+    "has_pending_login": "pending_login",
+    "haspendinglogin": "pending_login",
+    "loggedin": "logged_in",
+    "logged_in": "logged_in",
+    "has_logged_in": "logged_in",
+    "hasloggedin": "logged_in",
+}
+
+
 def normalize_customer_status(value: Any) -> str:
     if not isinstance(value, str):
         return ""
@@ -1284,18 +1296,7 @@ def normalize_customer_status(value: Any) -> str:
     normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", normalized)
     normalized = re.sub(r"[^a-z0-9_]+", "_", normalized)
     normalized = normalized.strip("_")
-    aliases = {
-        "pendinglogin": "pending_login",
-        "pending_login": "pending_login",
-        "has_pending_login": "pending_login",
-        "loggedin": "logged_in",
-        "logged_in": "logged_in",
-        "has_logged_in": "logged_in",
-        "hasloggedin": "logged_in",
-        "pendinglogin": "pending_login",
-        "haspendinglogin": "pending_login",
-    }
-    return aliases.get(normalized, normalized)
+    return CUSTOMER_STATUS_ALIASES.get(normalized, normalized)
 
 
 def customer_status(customer: dict[str, Any]) -> str:
@@ -1315,14 +1316,11 @@ def customer_status(customer: dict[str, Any]) -> str:
 
 
 def customer_status_label(status: str) -> str:
+    normalized = normalize_customer_status(status)
     return {
         "pending_login": "PENDING_LOGIN",
-        "pendinglogin": "PENDING_LOGIN",
-        "has_pending_login": "PENDING_LOGIN",
         "logged_in": "LOGGED_IN",
-        "loggedin": "LOGGED_IN",
-        "has_logged_in": "LOGGED_IN",
-    }.get(status, status or "unknown")
+    }.get(normalized, normalized or "unknown")
 
 
 def _merge_customer_contact(
