@@ -744,12 +744,22 @@ def _list_project_contacts(
             if response.get("isLastPage") is True:
                 break
             if not contacts:
-                if response.get("isLastPage") is False:
+                total = response.get("total")
+                if response.get("isLastPage") is False and page == 0 and (
+                    total in (None, 0) or not isinstance(total, int)
+                ):
+                    break
+                if response.get("isLastPage") is False and not isinstance(total, int):
                     raise ApiError(
                         "jira",
-                        f"project contact page at page={page} was empty but marked as not last",
+                        f"project contact page at page={page} was empty but did not report a valid total",
                     )
-                break
+                if isinstance(total, int) and total <= 0:
+                    break
+                raise ApiError(
+                    "jira",
+                    f"project contact page at page={page} was empty but marked as not last",
+                )
             total = response.get("total")
             if isinstance(total, int) and total >= 0 and len(all_contacts) >= total:
                 break
