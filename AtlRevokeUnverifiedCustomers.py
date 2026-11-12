@@ -1241,6 +1241,7 @@ def normalize_customer_status(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     normalized = value.strip().casefold().replace("-", "_").replace(" ", "_")
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", normalized)
     normalized = re.sub(r"[^a-z0-9_]+", "_", normalized)
     normalized = normalized.strip("_")
     aliases = {
@@ -1250,6 +1251,9 @@ def normalize_customer_status(value: Any) -> str:
         "loggedin": "logged_in",
         "logged_in": "logged_in",
         "has_logged_in": "logged_in",
+        "hasloggedin": "logged_in",
+        "pendinglogin": "pending_login",
+        "haspendinglogin": "pending_login",
     }
     return aliases.get(normalized, normalized)
 

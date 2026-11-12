@@ -566,6 +566,8 @@ class PerformanceOptimizationTests(unittest.TestCase):
     def test_status_aliases_map_active_users_to_logged_in(self) -> None:
         self.assertEqual(app.normalize_customer_status("has_logged_in"), "logged_in")
         self.assertEqual(app.normalize_customer_status("has_pending_login"), "pending_login")
+        self.assertEqual(app.normalize_customer_status("hasLoggedIn"), "logged_in")
+        self.assertEqual(app.normalize_customer_status("hasPendingLogin"), "pending_login")
         self.assertIsNotNone(
             app.customer_status({"loggedInStatus": "has_logged_in"})
         )
