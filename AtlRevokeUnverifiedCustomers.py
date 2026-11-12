@@ -731,10 +731,11 @@ def _list_project_contacts(
                 )
             )
             if page_signature and page_signature in seen_pages:
-                raise ApiError(
-                    "jira",
-                    f"project contact pagination repeated a page at page={page}",
+                warn(
+                    f"Project contact pagination repeated a page at page={page}; "
+                    f"stopping pagination and preserving {len(all_contacts)} contacts."
                 )
+                break
             if page_signature:
                 seen_pages.add(page_signature)
 
@@ -765,11 +766,17 @@ def _list_project_contacts(
                 break
             page += 1
     except ApiError as error:
-        if error.status not in {404, 405}:
+        if error.status in {404, 405} and not all_contacts:
+            response = request_json(legacy_url, api="jira", headers=headers)
+            page_values, _ = _parse_contact_page(response)
+            return [item for item in page_values if isinstance(item, dict)]
+        if error.status in {401, 403} or not all_contacts:
             raise
-        response = request_json(legacy_url, api="jira", headers=headers)
-        page_values, _ = _parse_contact_page(response)
-        return [item for item in page_values if isinstance(item, dict)]
+        warn(
+            f"Project contact pagination stopped at page={page} ({error}); "
+            f"preserving {len(all_contacts)} contacts."
+        )
+        return all_contacts
 
     return all_contacts
 
@@ -959,10 +966,6 @@ def list_customers(
                 "falling back to contact searches."
             )
             project_contacts = []
-        else:
-            project_contact_cache[str(resolved_project_id)] = _index_project_contacts(
-                project_contacts
-            )
         contact_indexes = _index_project_contacts(project_contacts)
         project_contact_cache[str(resolved_project_id)] = contact_indexes
         if not project_contacts:
@@ -1172,8 +1175,6 @@ def has_issues_for_accounts(
                 headers=jira_headers(config["jira_email"], config["jira_pat"]),
             )
         except ApiError as error:
-            if error.status == 400:
-                return False
             if error.status in {401, 403}:
                 raise
             return None
