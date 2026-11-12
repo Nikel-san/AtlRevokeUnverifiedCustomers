@@ -996,34 +996,66 @@ def list_customers(
             is_email_query: bool,
             is_display_name_query: bool = False,
         ) -> dict[str, Any] | None:
-            contact_query = urllib.parse.urlencode({"query": query})
-            contact_url = (
-                f"{config['site']}/rest/servicedesk/1/project/"
-                f"{urllib.parse.quote(str(resolved_project_id), safe='')}/contacts?"
-                f"{contact_query}"
-            )
-            try:
-                contact_response = request_json(
-                    contact_url, api="jira", headers=headers
+            def request_search_page(page: int) -> Any:
+                contact_url = (
+                    f"{config['site']}/rest/servicedesk/1/project/"
+                    f"{urllib.parse.quote(str(resolved_project_id), safe='')}/contacts/search"
                 )
-                contact_values, _ = _parse_contact_page(contact_response)
-            except ApiError as error:
-                if error.status in {401, 403}:
-                    raise
-                warn(
-                    f"Individual contact lookup failed ({error}); "
-                    "the customer will remain unverifiable unless another lookup succeeds."
+                params = urllib.parse.urlencode({"query": query, "page": page})
+                try:
+                    return request_json(
+                        f"{contact_url}?{params}",
+                        api="jira",
+                        headers=headers,
+                    )
+                except ApiError as error:
+                    if error.status not in {404, 405}:
+                        raise
+                    legacy_url = (
+                        f"{config['site']}/rest/servicedesk/1/project/"
+                        f"{urllib.parse.quote(str(resolved_project_id), safe='')}/contacts?"
+                        f"{urllib.parse.urlencode({'query': query})}"
+                    )
+                    return request_json(legacy_url, api="jira", headers=headers)
+
+            for page in range(10):
+                try:
+                    contact_response = request_search_page(page)
+                    contact_values, _ = _parse_contact_page(contact_response)
+                except ApiError as error:
+                    if error.status in {401, 403}:
+                        raise
+                    warn(
+                        f"Individual contact lookup failed ({error}); "
+                        "the customer will remain unverifiable unless another lookup succeeds."
+                    )
+                    return None
+                result = _find_contact(
+                    contact_values,
+                    account_id,
+                    email if is_email_query else "",
+                    display_name,
+                    accept_single_email_result=is_email_query,
+                    match_display_name=is_display_name_query,
                 )
-                return None
-            result = _find_contact(
-                contact_values,
-                account_id,
-                email if is_email_query else "",
-                display_name,
-                accept_single_email_result=is_email_query,
-                match_display_name=is_display_name_query,
-            )
-            return result if _is_complete_contact(result) else None
+                if result is not None:
+                    return result if _is_complete_contact(result) else None
+                if isinstance(contact_response, dict):
+                    is_last_page = contact_response.get("isLastPage")
+                    if is_last_page is True:
+                        break
+                    if not contact_values:
+                        break
+                    if "isLastPage" not in contact_response and "page" not in contact_response and "total" not in contact_response:
+                        break
+                    total = contact_response.get("total")
+                    if isinstance(total, int) and total >= 0 and page + 1 >= math.ceil(total / max(1, len(contact_values))):
+                        break
+                else:
+                    break
+                if not contact_values:
+                    break
+            return None
 
         if contact is None and not is_portal_customer_id(account_id):
             contact = find_contact_by_query(account_id, is_email_query=False)

@@ -236,6 +236,49 @@ class PerformanceOptimizationTests(unittest.TestCase):
         self.assertEqual(customers[0]["accountId"], "qm:unresolved")
         self.assertEqual(customers[0]["contactIdentifier"], "contact-id")
 
+    def test_individual_contact_queries_use_search_endpoint(self) -> None:
+        email = "unresolved@example.test"
+        seen_urls: list[str] = []
+
+        def fake_request(url: str, *, api: str, headers: dict[str, str]) -> dict:
+            parsed = urllib.parse.urlsplit(url)
+            seen_urls.append(url)
+            if "/servicedeskapi/servicedesk/12/customer" in parsed.path:
+                return {
+                    "isLastPage": True,
+                    "values": [{"accountId": "qm:unresolved", "emailAddress": email}],
+                }
+            if "/rest/servicedesk/1/project/34/contacts" in parsed.path and not parsed.query:
+                return {"contactResults": []}
+            self.assertIn("/contacts/search", parsed.path)
+            self.assertEqual(
+                urllib.parse.parse_qs(parsed.query),
+                {"query": [email], "page": ["0"]},
+            )
+            return {
+                "contactResults": [
+                    {
+                        "identifier": "contact-id",
+                        "loggedInStatus": "PENDING_LOGIN",
+                        "agent": False,
+                    }
+                ]
+            }
+
+        with mock.patch.object(app, "request_json", side_effect=fake_request):
+            customers = app.list_customers(
+                {
+                    "site": "https://example.test",
+                    "jira_email": "user@example.test",
+                    "jira_pat": "not-used",
+                },
+                "12",
+                project_id="34",
+            )
+
+        self.assertEqual(customers[0]["loggedInStatus"], "PENDING_LOGIN")
+        self.assertTrue(any("/contacts/search" in url for url in seen_urls))
+
     def test_individual_contact_cache_hit_avoids_project_bulk_request(self) -> None:
         requests: list[str] = []
 
@@ -245,27 +288,28 @@ class PerformanceOptimizationTests(unittest.TestCase):
             if "/servicedeskapi/servicedesk/" in parsed.path:
                 return {
                     "isLastPage": True,
-                        "values": [
-                            {
-                                "accountId": "qm:cached",
-                                "emailAddress": "cached@example.test",
-                            }
-                        ],
-                    }
-            if parsed.path.endswith("/contacts"):
-                    query = urllib.parse.parse_qs(parsed.query).get("query", [None])[0]
-                    if query is None:
-                        return {"contactResults": []}
-                    self.assertEqual(query, "cached@example.test")
-                    return {
-                        "contactResults": [
-                            {
-                                "identifier": "contact-id",
-                                "loggedInStatus": "PENDING_LOGIN",
-                                "agent": False,
-                            }
-                        ]
-                    }
+                    "values": [
+                        {
+                            "accountId": "qm:cached",
+                            "emailAddress": "cached@example.test",
+                        }
+                    ],
+                }
+            if "/contacts" in parsed.path:
+                query = urllib.parse.parse_qs(parsed.query).get("query", [None])[0]
+                if query is None:
+                    return {"contactResults": []}
+                self.assertEqual(query, "cached@example.test")
+                self.assertEqual(urllib.parse.parse_qs(parsed.query).get("page", ["0"])[0], "0")
+                return {
+                    "contactResults": [
+                        {
+                            "identifier": "contact-id",
+                            "loggedInStatus": "PENDING_LOGIN",
+                            "agent": False,
+                        }
+                    ]
+                }
             raise AssertionError(f"unexpected request: {url}")
 
         contact_cache: dict[tuple[str, str], dict] = {}
@@ -286,7 +330,7 @@ class PerformanceOptimizationTests(unittest.TestCase):
 
         self.assertEqual(
             sum(
-                urllib.parse.urlsplit(url).path.endswith("/contacts")
+                "/contacts" in urllib.parse.urlsplit(url).path
                 for url in requests
             ),
             2,
@@ -294,7 +338,7 @@ class PerformanceOptimizationTests(unittest.TestCase):
         contact_queries = [
             urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("query")
             for url in requests
-            if urllib.parse.urlsplit(url).path.endswith("/contacts")
+            if "/contacts" in urllib.parse.urlsplit(url).path
         ]
         self.assertEqual(contact_queries, [None, ["cached@example.test"]])
         self.assertEqual(len(requests), 4)
