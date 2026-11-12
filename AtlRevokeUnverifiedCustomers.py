@@ -706,7 +706,7 @@ def _list_project_contacts(
     legacy_url = f"{project_root}/contacts"
     all_contacts: list[dict[str, Any]] = []
     seen_pages: set[tuple[str, ...]] = set()
-    page = 0
+    page = 1
 
     def fetch_page(url: str, *, page_number: int) -> tuple[list[dict[str, Any]], dict[str, Any] | Any]:
         response = request_json(
@@ -745,7 +745,7 @@ def _list_project_contacts(
                 break
             if not contacts:
                 total = response.get("total")
-                if response.get("isLastPage") is False and page == 0 and (
+                if response.get("isLastPage") is False and page == 1 and (
                     total in (None, 0) or not isinstance(total, int)
                 ):
                     break
