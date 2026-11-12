@@ -18,6 +18,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -547,6 +548,34 @@ def resolve_service_desk_project_id(
     raise ApiError("jira", "service desk does not expose a project ID for contact discovery")
 
 
+def _extract_contact_page_values(page: Any) -> list[Any] | None:
+    if isinstance(page, list):
+        return page if all(isinstance(item, dict) for item in page) else None
+    if not isinstance(page, dict):
+        return None
+
+    for key in ("contactResults", "values", "data", "items", "results", "contacts"):
+        candidate = page.get(key)
+        if isinstance(candidate, list):
+            if all(isinstance(item, dict) for item in candidate):
+                return candidate
+            continue
+        if isinstance(candidate, dict):
+            nested = _extract_contact_page_values(candidate)
+            if nested is not None:
+                return nested
+
+    for value in page.values():
+        if isinstance(value, list):
+            if all(isinstance(item, dict) for item in value):
+                return value
+        elif isinstance(value, dict):
+            nested = _extract_contact_page_values(value)
+            if nested is not None:
+                return nested
+    return None
+
+
 def _parse_contact_page(
     page: dict[str, Any] | list[Any],
 ) -> tuple[list[Any], dict[str, Any]]:
@@ -557,20 +586,7 @@ def _parse_contact_page(
         metadata = dict(page)
         if isinstance(page.get("contactPageMetadata"), dict):
             metadata.update(page["contactPageMetadata"])
-        page_values = None
-        for key in ("contactResults", "values", "data", "items", "results", "contacts"):
-            candidate = page.get(key)
-            if isinstance(candidate, list):
-                page_values = candidate
-                break
-            if isinstance(candidate, dict):
-                for nested_key in ("values", "items", "results", "contacts"):
-                    nested = candidate.get(nested_key)
-                    if isinstance(nested, list):
-                        page_values = nested
-                        break
-                if isinstance(page_values, list):
-                    break
+        page_values = _extract_contact_page_values(page)
 
     if not isinstance(page_values, list):
         keys = sorted(page.keys()) if isinstance(page, dict) else type(page).__name__
@@ -591,9 +607,7 @@ def _normalized_contact_key(value: Any) -> str:
 def _is_complete_contact(contact: dict[str, Any] | None) -> bool:
     if not isinstance(contact, dict) or not isinstance(contact.get("agent"), bool):
         return False
-    status = normalize_customer_status(
-        contact.get("loggedInStatus") or contact.get("logged_in_status")
-    )
+    status = customer_status(contact)
     return status in {"pending_login", "logged_in"}
 
 
@@ -1165,21 +1179,42 @@ def is_portal_only(
 
 
 def normalize_customer_status(value: Any) -> str:
-    if isinstance(value, str):
-        return value.strip().casefold()
-    return ""
+    if not isinstance(value, str):
+        return ""
+    normalized = value.strip().casefold().replace("-", "_").replace(" ", "_")
+    normalized = re.sub(r"[^a-z0-9_]+", "_", normalized)
+    normalized = normalized.strip("_")
+    aliases = {
+        "pendinglogin": "pending_login",
+        "pending_login": "pending_login",
+        "loggedin": "logged_in",
+        "logged_in": "logged_in",
+    }
+    return aliases.get(normalized, normalized)
 
 
 def customer_status(customer: dict[str, Any]) -> str:
-    return normalize_customer_status(
-        customer.get("loggedInStatus") or customer.get("logged_in_status")
-    )
+    if not isinstance(customer, dict):
+        return ""
+    for key in (
+        "loggedInStatus",
+        "logged_in_status",
+        "loginStatus",
+        "login_status",
+        "status",
+    ):
+        status = normalize_customer_status(customer.get(key))
+        if status:
+            return status
+    return ""
 
 
 def customer_status_label(status: str) -> str:
     return {
         "pending_login": "PENDING_LOGIN",
+        "pendinglogin": "PENDING_LOGIN",
         "logged_in": "LOGGED_IN",
+        "loggedin": "LOGGED_IN",
     }.get(status, status or "unknown")
 
 
