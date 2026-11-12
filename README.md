@@ -91,12 +91,8 @@ python .\AtlRevokeUnverifiedCustomers.py -d 12
   emails to skip; exclusions take precedence over the input list.
 - `--dry-run`: preview decisions without removing customers. Live execution
   is the default.
-- `--workers N`: backward-compatible concurrency default for contact and
-  issue-history checks (default: 8).
-- `--contact-workers N`: maximum concurrent contact-detail requests; defaults
-  to `--workers`.
-- `--issue-workers N`: maximum concurrent issue-history requests; defaults
-  to `--workers`.
+- `--workers N`: maximum concurrent contact enrichment and issue-history
+  checks (default: 8).
 - `--out PATH`: write the CSV report to this path. Existing files are never
   overwritten. By default, a unique timestamped filename is generated.
 
@@ -126,16 +122,21 @@ desk(s) only. It never deletes or deactivates Atlassian accounts.
 
 Customers are enumerated with the paginated
 `GET /rest/servicedeskapi/servicedesk/{serviceDeskId}/customer` endpoint.
-The script reads the first page of the project contacts endpoint and caches its
-index by project ID for reuse across service desks. Contacts are indexed by
-account ID, email, and unique normalized display name. Unresolved customers
-fall back to individual searches by account ID and email; portal IDs (`qm:`)
-are searched by email, not by their internal ID. A single result from an email
-search is accepted even when Jira redacts its email or returns a different
-identifier. Ambiguous display-name matches are not used. If bulk discovery is
-unavailable, the script warns and uses the per-account fallback.
+Project contact discovery uses the paginated
+`GET /rest/servicedesk/1/project/{projectId}/contacts/search?query=&page=N`
+endpoint and falls back to the legacy `/contacts` endpoint when search is not
+available. Contacts are cached by project ID for reuse across service desks and
+indexed by account ID, email, and unique normalized display name. Unresolved
+customers fall back to individual searches by account ID and email; portal IDs
+(`qm:`) are searched by email, not by their internal ID. A single result from
+an email search is accepted even when Jira redacts its email or returns a
+different identifier. Ambiguous display-name matches are not used. If bulk
+discovery is unavailable, the script warns and uses the per-account fallback.
 
-Removal requires both `loggedInStatus: "PENDING_LOGIN"` and `agent: false`.
+Removal requires both a canonical `PENDING_LOGIN` status and `agent: false`.
+Statuses such as `has_logged_in`, `hasPendingLogin`, `loggedIn`, and similar
+Atlassian aliases are normalized before validation, while `LOGGED_IN` and other
+active states are preserved.
 `--input-file` narrows the contacts processed but cannot override those safety
 checks. Excluded and nonmatching customers remain in the report as skipped, and
 filtered customers are not contact-enriched. An empty input file matches no
@@ -148,10 +149,10 @@ Portal IDs (`qm:`) bypass JQL as specified. HTTP 400 is treated as no matching
 issues; authorization failures terminate with exit code 2. If issue verification
 is unavailable for any other reason, the customer is skipped and reported as
 unverifiable. Non-portal Atlassian accounts must also pass the Jira
-application-role, administrator-group, and organization-directory checks.
-Organization credentials are optional for portal-only processing; when
-organization validation is required but its credentials are missing, that
-account is skipped and processing continues.
+application-role and administrator-group checks, plus organization-directory
+validation when required. Organization credentials are optional for portal-only
+processing; when organization validation is required but its credentials are
+missing, that account is skipped and processing continues.
 
 Transient read-only GET failures (HTTP 429 and common 5xx responses) are
 retried with bounded backoff. HTTPS connections are reused, and fallback

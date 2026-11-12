@@ -1154,38 +1154,38 @@ def is_portal_customer_id(account_id: str) -> bool:
     return bool(account_id) and account_id.casefold().startswith("qm:")
 
 
-def has_issues(config: dict[str, str], account_id: str) -> bool | None:
-    if not account_id or is_portal_customer_id(account_id):
-        return False
-    query = f'reporter = "{account_id}" OR creator = "{account_id}"'
-    encoded_query = urllib.parse.quote(query)
-    try:
-        response = request_json(
-            f"{config['site']}/rest/api/3/search?maxResults=1&jql={encoded_query}",
-            api="jira",
-            headers=jira_headers(config["jira_email"], config["jira_pat"]),
-        )
-    except ApiError as error:
-        if error.status == 400:
-            return False
-        if error.status in {401, 403}:
-            raise
-        return None
-    except (OSError, http.client.HTTPException):
-        return None
-    if not isinstance(response, dict):
-        return None
-    total = response.get("total")
-    if not isinstance(total, int) or isinstance(total, bool) or total < 0:
-        return None
-    return total > 0
-
-
 def has_issues_for_accounts(
     config: dict[str, str], account_ids: list[str], workers: int = CONTACT_PAGE_WORKERS
 ) -> dict[str, bool | None]:
     if not account_ids:
         return {}
+
+    def check_issue_history(account_id: str) -> bool | None:
+        if not account_id or is_portal_customer_id(account_id):
+            return False
+        query = f'reporter = "{account_id}" OR creator = "{account_id}"'
+        encoded_query = urllib.parse.quote(query)
+        try:
+            response = request_json(
+                f"{config['site']}/rest/api/3/search?maxResults=1&jql={encoded_query}",
+                api="jira",
+                headers=jira_headers(config["jira_email"], config["jira_pat"]),
+            )
+        except ApiError as error:
+            if error.status == 400:
+                return False
+            if error.status in {401, 403}:
+                raise
+            return None
+        except (OSError, http.client.HTTPException):
+            return None
+        if not isinstance(response, dict):
+            return None
+        total = response.get("total")
+        if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+            return None
+        return total > 0
+
     results: dict[str, bool | None] = {}
     worker_count = min(
         len(account_ids),
@@ -1197,7 +1197,7 @@ def has_issues_for_accounts(
         for offset in range(0, len(account_ids), chunk_size):
             batch = account_ids[offset : offset + chunk_size]
             futures = {
-                executor.submit(has_issues, config, account_id): account_id
+                executor.submit(check_issue_history, account_id): account_id
                 for account_id in batch
             }
             for future in concurrent.futures.as_completed(futures):
@@ -1227,54 +1227,6 @@ def has_issues_for_accounts(
                     )
                     results[account_id] = None
     return results
-
-
-def is_portal_only(
-    account_type: str,
-    org_user: dict[str, Any] | None,
-    profile: dict[str, Any] | None,
-) -> tuple[bool, str]:
-    if account_type == "customer":
-        return True, ""
-    if account_type != "atlassian":
-        return False, "not a person Atlassian account"
-    if org_user is None:
-        return False, "not found in organization directory"
-    if profile is None or org_user.get("account_type") != "atlassian":
-        return False, "not a person Atlassian account"
-    if org_user.get("access_billable") is not False:
-        return False, "organization directory does not confirm an unlicensed account"
-    products = org_user.get("product_access")
-    if not isinstance(products, list):
-        return False, "organization directory product access is unavailable"
-    if any(
-        isinstance(product, dict)
-        and str(product.get("key", "")).casefold().startswith("jira")
-        for product in products
-    ):
-        return False, "has Jira product access"
-
-    application_roles = profile.get("applicationRoles")
-    if not isinstance(application_roles, dict) or not isinstance(
-        application_roles.get("items"), list
-    ):
-        return False, "Jira application roles could not be verified"
-    if application_roles.get("size") != len(application_roles["items"]):
-        return False, "Jira application roles could not be verified completely"
-    if application_roles["items"]:
-        return False, "has Jira application roles"
-
-    groups = profile.get("groups")
-    if not isinstance(groups, dict) or not isinstance(groups.get("items"), list):
-        return False, "Jira groups could not be verified"
-    if groups.get("size") != len(groups["items"]) or not all(
-        isinstance(group, dict) and isinstance(group.get("name"), str)
-        for group in groups["items"]
-    ):
-        return False, "Jira groups could not be verified completely"
-    if any("admin" in group["name"].casefold() for group in groups["items"]):
-        return False, "belongs to an administrator group"
-    return True, ""
 
 
 CUSTOMER_STATUS_ALIASES = {
@@ -1433,17 +1385,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
     project_contact_cache: dict[
         str, tuple[dict[str, dict[str, Any] | None], ...]
     ] = {}
-    contact_workers = min(
-        MAX_CONCURRENT_WORKERS,
-        max(
-            1,
-            args.workers if args.contact_workers is None else args.contact_workers,
-        ),
-    )
-    issue_workers = min(
-        MAX_CONCURRENT_WORKERS,
-        max(1, args.workers if args.issue_workers is None else args.issue_workers),
-    )
+    workers = min(MAX_CONCURRENT_WORKERS, max(1, args.workers))
 
     for desk in desks:
         desk_id = str(desk.get("id", ""))
@@ -1463,7 +1405,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
             exclude_ids=excluded_ids,
             contact_cache=contact_cache,
             project_contact_cache=project_contact_cache,
-            workers=contact_workers,
+            workers=workers,
         )
         for customer in customers:
             account_id = str(
@@ -1567,15 +1509,77 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
                     if org_users is None:
                         org_users = load_org_users(config)
                     org_user = org_users.get(account_id.casefold())
-                is_portal, portal_reason = is_portal_only(
-                    profile_type, org_user, profile
-                )
-                if not is_portal:
+                if profile_type == "customer":
+                    pass
+                elif profile_type != "atlassian":
+                    row["reason"] = "not a person Atlassian account"
+                    rows.append(row)
+                    continue
+                elif org_user is None:
+                    row["reason"] = "not found in organization directory"
+                    rows.append(row)
+                    continue
+                elif profile is None or org_user.get("account_type") != "atlassian":
+                    row["reason"] = "not a person Atlassian account"
+                    rows.append(row)
+                    continue
+                elif org_user.get("access_billable") is not False:
                     row["reason"] = (
-                        portal_reason or "account is not eligible for removal"
+                        "organization directory does not confirm an unlicensed account"
                     )
                     rows.append(row)
                     continue
+                else:
+                    products = org_user.get("product_access")
+                    if not isinstance(products, list):
+                        row["reason"] = (
+                            "organization directory product access is unavailable"
+                        )
+                        rows.append(row)
+                        continue
+                    if any(
+                        isinstance(product, dict)
+                        and str(product.get("key", "")).casefold().startswith("jira")
+                        for product in products
+                    ):
+                        row["reason"] = "has Jira product access"
+                        rows.append(row)
+                        continue
+
+                    application_roles = profile.get("applicationRoles")
+                    if not isinstance(application_roles, dict) or not isinstance(
+                        application_roles.get("items"), list
+                    ):
+                        row["reason"] = "Jira application roles could not be verified"
+                        rows.append(row)
+                        continue
+                    if application_roles.get("size") != len(application_roles["items"]):
+                        row["reason"] = "Jira application roles could not be verified completely"
+                        rows.append(row)
+                        continue
+                    if application_roles["items"]:
+                        row["reason"] = "has Jira application roles"
+                        rows.append(row)
+                        continue
+
+                    groups = profile.get("groups")
+                    if not isinstance(groups, dict) or not isinstance(
+                        groups.get("items"), list
+                    ):
+                        row["reason"] = "Jira groups could not be verified"
+                        rows.append(row)
+                        continue
+                    if groups.get("size") != len(groups["items"]) or not all(
+                        isinstance(group, dict) and isinstance(group.get("name"), str)
+                        for group in groups["items"]
+                    ):
+                        row["reason"] = "Jira groups could not be verified completely"
+                        rows.append(row)
+                        continue
+                    if any("admin" in group["name"].casefold() for group in groups["items"]):
+                        row["reason"] = "belongs to an administrator group"
+                        rows.append(row)
+                        continue
                 row["account_type"] = profile_type
 
             eligible_candidates.append((row, desk_id, account_id))
@@ -1583,7 +1587,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
     issue_results = has_issues_for_accounts(
         config,
         [account_id for _, _, account_id in eligible_candidates],
-        workers=issue_workers,
+        workers=workers,
     )
     candidates: list[tuple[dict[str, str], str, str]] = []
     for row, desk_id, account_id in eligible_candidates:
@@ -1745,17 +1749,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--workers",
         type=positive_int,
         default=CONTACT_PAGE_WORKERS,
-        help="Backward-compatible default concurrency for contacts and issue checks",
-    )
-    parser.add_argument(
-        "--contact-workers",
-        type=positive_int,
-        help="Maximum concurrent contact-detail requests (default: --workers)",
-    )
-    parser.add_argument(
-        "--issue-workers",
-        type=positive_int,
-        help="Maximum concurrent issue-history requests (default: --workers)",
+        help="Maximum concurrent contact and issue checks",
     )
     return parser.parse_args(argv)
 
