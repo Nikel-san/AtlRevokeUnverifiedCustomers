@@ -104,7 +104,8 @@ These patterns waste tokens and violate credit-efficiency rules:
 
 This repository contains `AtlRevokeUnverifiedCustomers.py`, which identifies inactive JSM
 portal customers and can remove their access from selected service desks.
-Atlassian accounts are never deleted or deactivated.
+Global account deletion is available only through the explicit `--delete-user`
+option; default runs do not delete or deactivate Atlassian accounts.
 
 ## Configuration
 
@@ -147,8 +148,9 @@ without an explicit `agent: false` are skipped. Non-portal candidates also
 require an issue-history check (`reporter = "{accountId}" OR creator =
 "{accountId}"`, `maxResults=1`). HTTP 400 means no matching issues; issue
 verification failures and authorization errors fail closed. `qm:` accounts
-bypass JQL and are treated as having no issues. No account deletion or global
-deactivation logic is used.
+bypass JQL and are treated as having no issues. Eligible accounts can be
+globally deleted with `--delete-user`, which requires
+Jira user-management permission.
 
 An optional `--input-file` limits processing to listed account IDs/emails; it
 does not bypass the pending-login or customer-role checks. Excluded and
@@ -171,13 +173,23 @@ python .\AtlRevokeUnverifiedCustomers.py -p HELP --dry-run
 python .\AtlRevokeUnverifiedCustomers.py --all-service-desks -f .\allow-list.csv --dry-run
 python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --input-file .\targets.csv --dry-run
 python .\AtlRevokeUnverifiedCustomers.py -d 12
+python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --delete-user --dry-run
 ```
 
 Without `--dry-run`, the script batches customer removals through the JSM
 service-desk customer endpoint, which requires a closed-access service desk and
-accepts portal `qm:` account IDs. Jira JSON error details are included in API
-exceptions and removal failure reports. It does not call any account deletion
-or deactivation endpoint.
+accepts portal `qm:` account IDs. If that endpoint returns HTTP 400 indicating
+that open access is enabled, the candidates are warned about and reported as
+skipped instead of errors. Jira JSON error response bodies are retained by
+`ApiError` and included in failure reports.
+
+With `--delete-user` (alias `--global-delete`), eligible accounts are deleted
+globally through `DELETE /rest/api/3/user?accountId=...`, one account at a time,
+instead of being unlinked from service desks. This includes eligible portal
+accounts and other candidates that pass the existing verification checks.
+`--dry-run` reports `would delete` in CSV and “would delete account” in the
+console without calling the endpoint. Global deletion is destructive and
+requires Jira user-management permission.
 
 Console and CSV output include the account type and contact `loggedInStatus`
 (`PENDING_LOGIN`, `LOGGED_IN`, or the endpoint-reported state) alongside the
