@@ -103,9 +103,8 @@ These patterns waste tokens and violate credit-efficiency rules:
 # Customer access cleanup procedure
 
 This repository contains `AtlRevokeUnverifiedCustomers.py`, which identifies inactive JSM
-portal customers and can remove their access from selected service desks.
-Global account deletion is available only through the explicit `--delete-user`
-option; default runs do not delete or deactivate Atlassian accounts.
+portal customers and globally deletes eligible Jira accounts by default.
+Service-desk access is not merely unlinked.
 
 ## Configuration
 
@@ -148,9 +147,8 @@ without an explicit `agent: false` are skipped. Non-portal candidates also
 require an issue-history check (`reporter = "{accountId}" OR creator =
 "{accountId}"`, `maxResults=1`). HTTP 400 means no matching issues; issue
 verification failures and authorization errors fail closed. `qm:` accounts
-bypass JQL and are treated as having no issues. Eligible accounts can be
-globally deleted with `--delete-user`, which requires
-Jira user-management permission.
+bypass JQL and are treated as having no issues. Eligible accounts are deleted
+globally through Jira's User API; Jira user-management permission is required.
 
 An optional `--input-file` limits processing to listed account IDs/emails; it
 does not bypass the pending-login or customer-role checks. Excluded and
@@ -163,9 +161,9 @@ issue checks. `--contact-workers` and `--issue-workers` override these limits
 independently. Each value must be a positive integer; worker counts are capped
 at 32.
 
-Runs remove access by default. Pass `--dry-run` to inspect the console
-decisions and timestamped CSV report without making changes. Reports are
-created in the current directory and are never overwritten.
+Runs delete eligible accounts globally by default. Pass `--dry-run` to inspect
+the console decisions and timestamped CSV report without deleting accounts.
+Reports are created in the current directory and are never overwritten.
 
 ```powershell
 python .\AtlRevokeUnverifiedCustomers.py -d 12 --dry-run
@@ -173,23 +171,17 @@ python .\AtlRevokeUnverifiedCustomers.py -p HELP --dry-run
 python .\AtlRevokeUnverifiedCustomers.py --all-service-desks -f .\allow-list.csv --dry-run
 python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --input-file .\targets.csv --dry-run
 python .\AtlRevokeUnverifiedCustomers.py -d 12
-python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --delete-user --dry-run
+python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --dry-run
 ```
 
-Without `--dry-run`, the script batches customer removals through the JSM
-service-desk customer endpoint, which requires a closed-access service desk and
-accepts portal `qm:` account IDs. If that endpoint returns HTTP 400 indicating
-that open access is enabled, the candidates are warned about and reported as
-skipped instead of errors. Jira JSON error response bodies are retained by
-`ApiError` and included in failure reports.
-
-With `--delete-user` (alias `--global-delete`), eligible accounts are deleted
-globally through `DELETE /rest/api/3/user?accountId=...`, one account at a time,
-instead of being unlinked from service desks. This includes eligible portal
-accounts and other candidates that pass the existing verification checks.
-`--dry-run` reports `would delete` in CSV and “would delete account” in the
-console without calling the endpoint. Global deletion is destructive and
-requires Jira user-management permission.
+Without `--dry-run`, the script deletes each eligible account globally through
+`DELETE /rest/api/3/user?accountId=...`. Candidates are grouped by account ID,
+so an account present in multiple selected service desks is deleted only once.
+The report uses `deleted`, `would delete`, `skipped`, and `error` actions;
+dry-run displays “would delete account” in the console and never calls the
+deletion endpoint. Jira JSON error response bodies are retained by `ApiError`
+and included in failure reports. Account deletion requires Jira
+user-management permission and is never automatically retried.
 
 Console and CSV output include the account type and contact `loggedInStatus`
 (`PENDING_LOGIN`, `LOGGED_IN`, or the endpoint-reported state) alongside the
@@ -200,4 +192,4 @@ Use `-s` / `--site` for the Jira site hostname or URL (`ATLASSIAN_SITE`).
 Without it, a unique timestamped report filename is generated. The console
 prints each customer decision and a summary; color labels are limited to
 interactive terminals and respect `NO_COLOR`. Transient GET failures are
-retried with bounded backoff; removals are never automatically retried.
+retried with bounded backoff; account deletions are never automatically retried.

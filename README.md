@@ -1,16 +1,16 @@
 # AtlRevokeUnverifiedCustomers
 
-Remove JSM portal customers with `loggedInStatus` exactly `PENDING_LOGIN` from
+Identify JSM portal customers with `loggedInStatus` exactly `PENDING_LOGIN` from
 one or every Atlassian service desk. A contact must also have `agent: false`.
 Logged-in customers and contacts without a confirmed customer role or pending
-login status are preserved. By default, access is removed from service desks
-only. The opt-in `--delete-user` mode permanently deletes eligible accounts
-globally.
+login status are preserved. Eligible accounts are permanently deleted from
+Jira globally by default; their access is not merely unlinked from service
+desks.
 JSM portal-only accounts (`qm:` IDs or Jira `accountType=customer`) are
 identified directly and do not require an Organization directory record.
 
-Live execution is the default. Add `--dry-run` to preview removals or account
-deletions without changing service-desk access or deleting accounts.
+Live execution is the default. Add `--dry-run` to preview account deletions
+without deleting accounts.
 
 ## Requirements
 
@@ -21,9 +21,9 @@ deletions without changing service-desk access or deleting accounts.
 - Permission to search issues in relevant Jira projects.
 - Organization directory permission when validating non-portal Atlassian
   accounts.
-- Permission to list service desks and remove customers from selected desks
+- Permission to list service desks and delete eligible Jira accounts
   when running live.
-- Jira user-management permission when using `--delete-user`.
+- Jira user-management permission.
 
 ## Environment variables
 
@@ -64,20 +64,19 @@ python .\AtlRevokeUnverifiedCustomers.py -p HELP --dry-run
 python .\AtlRevokeUnverifiedCustomers.py -s your-site.atlassian.net --all-service-desks --dry-run
 ```
 
-By default, live runs only unlink customers from selected service desks. To
-permanently delete eligible Jira accounts globally, preview first with
-`--delete-user --dry-run`, then omit `--dry-run` only after reviewing the
-report:
+Live runs permanently delete eligible Jira accounts globally. Preview the
+deletions first with `--dry-run`, then omit it only after reviewing the report:
 
 ```powershell
-python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --delete-user --dry-run
-python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --delete-user
+python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --dry-run
+python .\AtlRevokeUnverifiedCustomers.py --all-service-desks
 ```
 
 Global deletion uses Jira's `DELETE /rest/api/3/user?accountId=...` endpoint.
-It applies only to candidates that pass the existing pending-login, customer,
-issue-history, and account-validation checks; use it with care because it
-deletes the account rather than only removing service-desk access.
+Eligible accounts are grouped by account ID, so each account is deleted once
+even if it appears in multiple selected service desks. Deletion applies only to
+candidates that pass the existing pending-login, customer, issue-history, and
+account-validation checks.
 
 Target only listed account IDs/emails, while excluding an allow-list:
 
@@ -85,7 +84,7 @@ Target only listed account IDs/emails, while excluding an allow-list:
 python .\AtlRevokeUnverifiedCustomers.py --all-service-desks --input-file .\targets.csv -f .\allow-list.csv --dry-run
 ```
 
-After reviewing a dry-run report, omit `--dry-run` to remove access:
+After reviewing a dry-run report, omit `--dry-run` to delete eligible accounts:
 
 ```powershell
 python .\AtlRevokeUnverifiedCustomers.py -d 12
@@ -102,15 +101,12 @@ python .\AtlRevokeUnverifiedCustomers.py -d 12
 - `--jira-email`: Jira service-account email (env: `JIRA_EMAIL`).
 - `--jira-pat`: Jira API token (env: `JIRA_PAT`).
 - `--input-file PATH`: CSV or newline-delimited IDs/emails to limit processing
-  to matching contacts; matches are still removed only when their
+  to matching contacts; matches are still deleted only when their
   `loggedInStatus` is `PENDING_LOGIN` and `agent` is `false`.
 - `-f`, `--exclude-file PATH` (alias `--filename`): CSV allow-list of IDs or
   emails to skip; exclusions take precedence over the input list.
-- `--dry-run`: preview decisions without removing customers or deleting
-  accounts. Live execution is the default.
-- `--delete-user`, `--global-delete`: permanently delete eligible Jira
-  accounts globally instead of removing their service-desk access. Requires
-  Jira user-management permission.
+- `--dry-run`: preview decisions without deleting accounts. Live deletion is
+  the default.
 - `--workers N`: maximum concurrent contact enrichment and issue-history
   checks (default: 8).
 - `--out PATH`: write the CSV report to this path. Existing files are never
@@ -120,8 +116,8 @@ python .\AtlRevokeUnverifiedCustomers.py -d 12
 
 The script prints each customer’s email, display name, account ID, account
 type, service desk, status, action, and reason, followed by a summary of desks
-processed, customers scanned, candidates, removals/deletions, skips, and
-errors. `WARN`, `SUCCESS`, and `ERROR` labels and action statuses use color in
+processed, customers scanned, candidates, deleted/would-delete accounts,
+skips, and errors. `WARN`, `SUCCESS`, and `ERROR` labels and action statuses use color in
 interactive terminals and respect `NO_COLOR`.
 
 The CSV report contains these columns:
@@ -134,14 +130,13 @@ The CSV report contains these columns:
 | `account_type` | `customer`, `atlassian`, or the profile-reported account type |
 | `service_desk` | Service-desk name |
 | `status` | Contact `loggedInStatus`, including `PENDING_LOGIN` or `LOGGED_IN` |
-| `action` | `would remove`, `removed`, `would delete`, `deleted`, `skipped`, or `error` |
+| `action` | `would delete`, `deleted`, `skipped`, or `error` |
 | `reason` | Explanation for a skipped or failed action |
 
-In default live mode the script removes customer access from selected service
-desks only; it never deletes or deactivates accounts. With `--delete-user`, it
-instead issues one global Jira user deletion per eligible account. Dry-run
-reports the action as `would delete` (displayed as “would delete account”) and
-never sends the deletion request.
+In live mode the script issues one global Jira user deletion per eligible
+account, deduplicated across selected service desks. Dry-run reports the action
+as `would delete` (displayed as “would delete account”) and never sends the
+deletion request.
 
 Customers are enumerated with the paginated
 `GET /rest/servicedeskapi/servicedesk/{serviceDeskId}/customer` endpoint.
@@ -156,7 +151,8 @@ an email search is accepted even when Jira redacts its email or returns a
 different identifier. Ambiguous display-name matches are not used. If bulk
 discovery is unavailable, the script warns and uses the per-account fallback.
 
-Removal requires both a canonical `PENDING_LOGIN` status and `agent: false`.
+Deletion eligibility requires both a canonical `PENDING_LOGIN` status and
+`agent: false`.
 Statuses such as `has_logged_in`, `hasPendingLogin`, `loggedIn`, and similar
 Atlassian aliases are normalized before validation, while `LOGGED_IN` and other
 active states are preserved.
@@ -179,8 +175,6 @@ missing, that account is skipped and processing continues.
 
 Transient read-only GET failures (HTTP 429 and common 5xx responses) are
 retried with bounded backoff. HTTPS connections are reused, and fallback
-contact lookups run concurrently. Service-desk removal requests are never
-automatically retried and are sent in batches of 50. Open-access desks reject
-membership removal; those candidates are warned about and reported as skipped
-with the reason `service desk has open access enabled`. Jira JSON error details
-are retained in API errors and included in failure messages and CSV reasons.
+contact lookups run concurrently. Account deletion requests are never
+automatically retried. Jira JSON error details are retained in API errors and
+included in failure messages and CSV reasons.

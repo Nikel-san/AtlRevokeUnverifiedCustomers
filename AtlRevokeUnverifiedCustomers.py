@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """AtlRevokeUnverifiedCustomers.py
 
-Remove JSM portal customers with PENDING_LOGIN status from selected service
-desks, or delete eligible accounts globally when explicitly requested. Live
-changes are the default; use --dry-run to preview them.
+Delete eligible Jira accounts globally for PENDING_LOGIN JSM customer
+accounts found in selected service desks. Live deletion is the default; use
+--dry-run to preview deletions.
 
 Environment variables:
 - ATLASSIAN_TOKEN / ATLASSIAN_ORG: Organization directory access
@@ -31,7 +31,6 @@ from typing import Any
 
 ORG_API_BASE = "https://api.atlassian.com/admin/v1"
 PAGE_SIZE = 100
-REMOVE_BATCH_SIZE = 50
 CONTACT_PAGE_SIZE = 50
 PROJECT_CONTACT_PAGE_SIZE = 100
 CONTACT_PAGE_WORKERS = 8
@@ -1204,18 +1203,6 @@ def delete_jira_user(config: dict[str, str], account_id: str) -> None:
     )
 
 
-def is_open_access_removal_error(error: ApiError) -> bool:
-    if error.status != 400:
-        return False
-    detail = _format_error_detail(error.body)
-    if not detail:
-        return False
-    normalized_detail = " ".join(detail.casefold().replace("-", " ").split())
-    return (
-        re.search(r"\bopen access (?:is )?enabled\b", normalized_detail) is not None
-    )
-
-
 def is_portal_customer_id(account_id: str) -> bool:
     return bool(account_id) and account_id.casefold().startswith("qm:")
 
@@ -1367,13 +1354,6 @@ def _merge_customer_contact(
     return merged
 
 
-def customer_url(config: dict[str, str], service_desk_id: str) -> str:
-    return (
-        f"{config['site']}/rest/servicedeskapi/servicedesk/"
-        f"{urllib.parse.quote(service_desk_id, safe='')}/customer"
-    )
-
-
 def write_report(rows: list[dict[str, str]], output_path: str | None = None) -> Path:
     if output_path:
         path = Path(output_path)
@@ -1402,9 +1382,7 @@ def print_row(row: dict[str, str]) -> None:
     action = row["action"]
     colors = {
         "deleted": ANSI_GREEN,
-        "removed": ANSI_GREEN,
         "would delete": ANSI_YELLOW,
-        "would remove": ANSI_YELLOW,
         "error": ANSI_RED,
     }
     if action in colors and "NO_COLOR" not in os.environ and sys.stdout.isatty():
@@ -1428,11 +1406,7 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
         if not report_path.parent.is_dir():
             raise ValueError(f"report directory does not exist: {report_path.parent}")
     if args.dry_run:
-        warn(
-            "Dry-run mode: no Jira accounts will be deleted."
-            if args.delete_user
-            else "Dry-run mode: no service-desk access will be changed."
-        )
+        warn("Dry-run mode: no Jira accounts will be deleted.")
     input_mode = args.input_file is not None
     input_ids = read_identifiers(args.input_file)
     excluded_ids = read_identifiers(args.exclude_file)
@@ -1683,98 +1657,34 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
             log_error(f"Input target was not found in selected service desks: {identifier}")
             error_count += 1
 
-    if args.delete_user:
-        candidates_by_account: dict[str, list[dict[str, str]]] = {}
-        for row, _, account_id in candidates:
-            candidates_by_account.setdefault(account_id, []).append(row)
-        for account_id, account_rows in candidates_by_account.items():
-            if args.dry_run:
+    candidates_by_account: dict[str, list[dict[str, str]]] = {}
+    for row, _, account_id in candidates:
+        candidates_by_account.setdefault(account_id, []).append(row)
+    for account_id, account_rows in candidates_by_account.items():
+        if args.dry_run:
+            for row in account_rows:
+                row["action"] = "would delete"
+                row["reason"] = ""
+        else:
+            try:
+                delete_jira_user(config, account_id)
+            except ApiError as error:
+                error_count += len(account_rows)
+                reason = f"account deletion failed ({error})"
                 for row in account_rows:
-                    row["action"] = "would delete"
-                    row["reason"] = ""
+                    row["action"] = "error"
+                    row["reason"] = reason
+                log_error(f"{reason} for account {account_id}")
             else:
-                try:
-                    delete_jira_user(config, account_id)
-                except ApiError as error:
-                    error_count += len(account_rows)
-                    reason = f"account deletion failed ({error})"
-                    for row in account_rows:
-                        row["action"] = "error"
-                        row["reason"] = reason
-                    log_error(f"{reason} for account {account_id}")
-                else:
-                    for row in account_rows:
-                        row["action"] = "deleted"
-                    success(f"Deleted Jira account {account_id}")
-            rows.extend(account_rows)
-    else:
-        candidates_by_desk: dict[str, list[tuple[dict[str, str], str, str]]] = {}
-        for candidate in candidates:
-            candidates_by_desk.setdefault(candidate[1], []).append(candidate)
-        for desk_id, desk_candidates in candidates_by_desk.items():
-            total_revocations = len(desk_candidates)
-            processed_revocations = 0
-            for index in range(0, len(desk_candidates), REMOVE_BATCH_SIZE):
-                batch = desk_candidates[index : index + REMOVE_BATCH_SIZE]
-                for row, _, _ in batch:
-                    row["action"] = "would remove" if args.dry_run else "pending"
-                    row["reason"] = ""
-                if not args.dry_run:
-                    account_ids = [account_id for _, _, account_id in batch]
-                    try:
-                        request_json(
-                            customer_url(config, desk_id),
-                            api="jira",
-                            headers={
-                                **jira_headers(config["jira_email"], config["jira_pat"]),
-                                "X-ExperimentalApi": "opt-in",
-                            },
-                            method="DELETE",
-                            body={"accountIds": account_ids},
-                        )
-                        processed_revocations += len(batch)
-                        if sys.stderr.isatty():
-                            sys.stderr.write(
-                                f"\rRevoking access: {processed_revocations}/{total_revocations}..."
-                            )
-                            sys.stderr.flush()
-                    except ApiError as error:
-                        if is_open_access_removal_error(error):
-                            reason = "service desk has open access enabled"
-                            for row, _, _ in batch:
-                                row["action"] = "skipped"
-                                row["reason"] = reason
-                            warn(
-                                f"{reason}; skipping {len(batch)} candidates "
-                                f"in service desk {desk_id}"
-                            )
-                        else:
-                            error_count += len(batch)
-                            reason = f"removal failed ({error})"
-                            for row, _, _ in batch:
-                                row["action"] = "error"
-                                row["reason"] = reason
-                            log_error(
-                                f"{reason} for {len(batch)} customers "
-                                f"in service desk {desk_id}"
-                            )
-                    else:
-                        for row, _, _ in batch:
-                            row["action"] = "removed"
-                        success(
-                            f"Removed {len(batch)} customers from service desk {desk_id}"
-                        )
-                rows.extend(row for row, _, _ in batch)
-            if sys.stderr.isatty():
-                sys.stderr.write("\n")
-                sys.stderr.flush()
+                for row in account_rows:
+                    row["action"] = "deleted"
+                success(f"Deleted Jira account {account_id}")
+        rows.extend(account_rows)
 
     for row in rows:
         print_row(row)
     report_path = write_report(rows, args.out)
     candidates_count = len(candidates)
-    removed_count = sum(row["action"] == "removed" for row in rows)
-    would_remove_count = sum(row["action"] == "would remove" for row in rows)
     deleted_count = len(
         {row["account_id"] for row in rows if row["action"] == "deleted"}
     )
@@ -1788,8 +1698,6 @@ def process(args: argparse.Namespace, config: dict[str, str]) -> int:
     print(f"  Stale candidates: {candidates_count}")
     print(f"  Would delete accounts: {would_delete_count}")
     print(f"  Deleted accounts: {deleted_count}")
-    print(f"  Would remove: {would_remove_count}")
-    print(f"  Removed: {removed_count}")
     print(f"  Skipped: {skipped_count}")
     print(f"  Errors: {error_count}")
     success(f"CSV report written to {report_path}")
@@ -1809,8 +1717,8 @@ def positive_int(value: str) -> int:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Remove PENDING_LOGIN JSM portal customers from service desks, "
-            "or globally delete eligible accounts."
+            "Delete eligible PENDING_LOGIN JSM customer accounts globally "
+            "from selected service desks."
         )
     )
     parser.add_argument(
@@ -1861,14 +1769,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="report actions without changing service-desk access or deleting accounts",
-    )
-    parser.add_argument(
-        "--delete-user",
-        "--global-delete",
-        dest="delete_user",
-        action="store_true",
-        help="permanently delete eligible Jira accounts globally instead of unlinking them",
+        help="report eligible account deletions without deleting Jira accounts",
     )
     parser.add_argument(
         "--out",
